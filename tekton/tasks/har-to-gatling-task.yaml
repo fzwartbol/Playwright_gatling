@@ -17,7 +17,7 @@ spec:
     - name: source
   results:
     - name: simulations-dir
-      description: Path to generated Scala simulation files
+      description: Path to generated Java simulation files
   steps:
     - name: convert
       image: node:20-slim
@@ -31,7 +31,7 @@ spec:
         #!/usr/bin/env bash
         set -euo pipefail
         HAR_DIR="${HAR_DIR:-$(workspaces.source.path)/har}"
-        OUT_DIR="$(workspaces.source.path)/gatling/src/test/scala/simulations"
+        OUT_DIR="$(workspaces.source.path)/gatling/src/test/java/simulations"
         mkdir -p "$OUT_DIR"
 
         for har_file in "$HAR_DIR"/*.har; do
@@ -44,7 +44,7 @@ spec:
             --har "$har_file" \
             --simulation "$class" \
             --base-url "$BASE_URL" \
-            --out "$OUT_DIR/${class}.scala"
+            --out "$OUT_DIR/${class}.java"
         done
 
         echo -n "$OUT_DIR" > $(results.simulations-dir.path)

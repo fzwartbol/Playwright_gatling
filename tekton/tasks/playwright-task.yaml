@@ -4,14 +4,14 @@ metadata:
   name: playwright-record-har
 spec:
   description: >
-    Runs Playwright tests against BASE_URL and records HAR files to the shared workspace.
+    Runs Playwright (Java) tests against BASE_URL and records HAR files to the shared workspace.
   params:
     - name: base-url
       type: string
       description: Application URL under test
     - name: test-filter
       type: string
-      description: Glob or file path passed to `playwright test` (empty = all tests)
+      description: Surefire -Dtest filter passed to `mvn test` (empty = all tests)
       default: ""
   workspaces:
     - name: source
@@ -20,24 +20,20 @@ spec:
     - name: har-dir
       description: Path to the directory containing recorded HAR files
   steps:
-    - name: install
-      image: mcr.microsoft.com/playwright:v1.44.0-jammy
-      workingDir: $(workspaces.source.path)/playwright
-      script: |
-        #!/usr/bin/env bash
-        set -euo pipefail
-        npm ci
     - name: record
-      image: mcr.microsoft.com/playwright:v1.44.0-jammy
+      # Official Playwright-for-Java image with browsers + OS deps preinstalled
+      image: mcr.microsoft.com/playwright/java:v1.44.0-jammy
       workingDir: $(workspaces.source.path)/playwright
       env:
         - name: BASE_URL
           value: $(params.base-url)
-        - name: HAR_URL_FILTER
-          value: "$(params.base-url)/**"
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
         mkdir -p $(workspaces.source.path)/har
-        npx playwright test $(params.test-filter)
+        TEST_ARG=""
+        if [ -n "$(params.test-filter)" ]; then
+          TEST_ARG="-Dtest=$(params.test-filter)"
+        fi
+        mvn -B test $TEST_ARG
         echo -n "$(workspaces.source.path)/har" > $(results.har-dir.path)

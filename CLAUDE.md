@@ -7,14 +7,13 @@ Flow: Playwright (Node.js) records HAR files → `har-to-gatling` converts to Sc
 ## Repository Layout
 ```
 .
-├── playwright/          # Playwright test suite (TypeScript)
-│   ├── tests/           # .spec.ts test files
-│   ├── playwright.config.ts
-│   └── package.json
-├── gatling/             # Gatling Maven project (Scala simulations)
+├── playwright/          # Playwright test suite (Java bindings + JUnit 5)
+│   ├── src/test/java/tests/   # *Test.java journeys (extend BaseHarTest)
+│   └── pom.xml
+├── gatling/             # Gatling Maven project (Java DSL simulations)
 │   ├── src/
 │   │   └── test/
-│   │       ├── scala/   # Generated + hand-edited simulations
+│   │       ├── java/    # Generated + hand-edited simulations (simulations/*.java)
 │   │       └── resources/
 │   │           └── gatling.conf
 │   └── pom.xml
@@ -27,15 +26,15 @@ Flow: Playwright (Node.js) records HAR files → `har-to-gatling` converts to Sc
 
 ## Key Commands
 
-### Playwright
+### Playwright (Java)
 ```bash
 cd playwright
-npm ci
-npx playwright install --with-deps
-# Record HAR files (all tests)
-npx playwright test --reporter=dot
-# Record HAR for a single test file
-npx playwright test tests/checkout.spec.ts
+# One-time: install browser binaries used by the Playwright Java bindings
+mvn -q compile exec:java -e -Dexec.mainClass=com.microsoft.playwright.CLI -Dexec.args="install --with-deps"
+# Record HAR files (all tests) — HAR written to ../har/<name>.har
+BASE_URL=https://myapp.example.com mvn test
+# Record HAR for a single test class or method
+BASE_URL=https://myapp.example.com mvn test -Dtest=ExampleTest#checkout
 ```
 
 ### HAR Inspection
@@ -80,13 +79,15 @@ When generating Gatling simulations from HAR files, **exclude** these patterns:
 Only include requests to the **application under test** domain(s).
 
 ## Gatling Simulation Conventions
+- **Language: Java DSL** (Gatling 3.7+ Java API). Source lives in `gatling/src/test/java/simulations/`.
 - One simulation class per user journey (e.g. `CheckoutSimulation`, `SearchSimulation`)
-- Namespace: `simulations`
-- Extend `io.gatling.core.scenario.Simulation`
+- Package: `simulations`
+- Extend `io.gatling.javaapi.core.Simulation`; static-import `CoreDsl.*` and `HttpDsl.*`
+- `setUp(...)` goes in an instance initializer block `{ ... }`; injection profile uses `injectOpen(...)`
 - Use `constantUsersPerSec` for baseline, `rampUsersPerSec` for ramp scenarios
 - Pause times: use `pause(1, 3)` (random 1–3 s) unless the HAR shows a specific think time
 - Feeders: CSV files in `src/test/resources/feeders/`
-- Checks: always assert HTTP status 200 (or expected code); add regex check on key response field when available
+- Checks: always assert HTTP status with `status().in(...)` / `status().is(...)`; add a regex check on a key response field when available
 
 ## Tekton Pipeline Topology
 ```

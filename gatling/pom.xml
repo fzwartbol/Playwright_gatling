@@ -10,16 +10,14 @@
   <packaging>jar</packaging>
 
   <properties>
-    <maven.compiler.source>11</maven.compiler.source>
-    <maven.compiler.target>11</maven.compiler.target>
+    <maven.compiler.release>11</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <gatling.version>3.11.5</gatling.version>
     <gatling-maven-plugin.version>4.9.6</gatling-maven-plugin.version>
-    <scala-maven-plugin.version>4.9.2</scala-maven-plugin.version>
-    <scala.version>2.13.14</scala.version>
   </properties>
 
   <dependencies>
+    <!-- Gatling Java DSL + charts. The Java API ships inside this artifact. -->
     <dependency>
       <groupId>io.gatling.highcharts</groupId>
       <artifactId>gatling-charts-highcharts</artifactId>
@@ -29,20 +27,11 @@
   </dependencies>
 
   <build>
-    <sourceDirectory>src/test/scala</sourceDirectory>
-    <testSourceDirectory>src/test/scala</testSourceDirectory>
     <plugins>
       <plugin>
-        <groupId>net.alchim31.maven</groupId>
-        <artifactId>scala-maven-plugin</artifactId>
-        <version>${scala-maven-plugin.version}</version>
-        <executions>
-          <execution>
-            <goals>
-              <goal>testCompile</goal>
-            </goals>
-          </execution>
-        </executions>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
       </plugin>
       <plugin>
         <groupId>io.gatling</groupId>

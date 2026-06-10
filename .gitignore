@@ -1,8 +1,5 @@
-# Playwright
-playwright/node_modules/
-playwright/dist/
-playwright/test-results/
-playwright/playwright-report/
+# Playwright (Java Maven project)
+playwright/target/
 
 # HAR files — generated at runtime, not committed
 har/
@@ -10,7 +7,7 @@ har/
 # Gatling build output
 gatling/target/
 
-# Maven
+# Maven local repo cache
 .m2/
 *.class
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Converts a HAR file into a Gatling Scala simulation.
+ * Converts a HAR file into a Gatling Java simulation (Gatling Java DSL).
  *
  * Usage:
  *   node scripts/har-to-gatling.js --har har/checkout.har \
  *       --simulation CheckoutSimulation \
  *       --base-url https://myapp.example.com \
- *       --out gatling/src/test/scala/simulations/CheckoutSimulation.scala
+ *       --out gatling/src/test/java/simulations/CheckoutSimulation.java
  */
 'use strict';
 
@@ -23,7 +23,7 @@ function getArg(flag) {
 const harPath        = getArg('--har');
 const simulationName = getArg('--simulation') || 'GeneratedSimulation';
 const baseUrl        = getArg('--base-url')   || 'http://localhost:3000';
-const outPath        = getArg('--out')         || `gatling/src/test/scala/simulations/${simulationName}.scala`;
+const outPath        = getArg('--out')         || `gatling/src/test/java/simulations/${simulationName}.java`;
 
 if (!harPath) {
   console.error('Usage: node har-to-gatling.js --har <file> [--simulation Name] [--base-url URL] [--out file]');
@@ -58,7 +58,8 @@ const filtered = entries
     const method  = e.request.method.toUpperCase();
     const status  = (e.response && e.response.status) || 200;
     const body    = e.request.postData ? e.request.postData.text : null;
-    return { relPath, method, status, body, name: `${method} ${url.pathname}` };
+    const contentType = e.request.postData ? e.request.postData.mimeType : null;
+    return { relPath, method, status, body, contentType, name: `${method} ${url.pathname}` };
   });
 
 if (filtered.length === 0) {
@@ -66,20 +67,27 @@ if (filtered.length === 0) {
   process.exit(1);
 }
 
-// --- Render Scala ---
-function escapeScala(s) {
+// --- Render Java ---
+function escapeJava(s) {
   return (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 }
 
 function renderRequest(entry, idx) {
   const lines = [];
   lines.push(`    .exec(`);
-  lines.push(`      http("${escapeScala(entry.name)}")`);
-  lines.push(`        .${entry.method.toLowerCase()}("${escapeScala(entry.relPath)}")`);
-  if (entry.body) {
-    lines.push(`        .body(StringBody("${escapeScala(entry.body)}"))`);
+  lines.push(`      http("${escapeJava(entry.name)}")`);
+  lines.push(`        .${entry.method.toLowerCase()}("${escapeJava(entry.relPath)}")`);
+  if (entry.contentType) {
+    // Strip any charset suffix for a clean header value
+    const ct = entry.contentType.split(';')[0].trim();
+    lines.push(`        .header("Content-Type", "${escapeJava(ct)}")`);
   }
-  lines.push(`        .check(status.in(${entry.status}, 200, 201, 204))`);
+  if (entry.body) {
+    lines.push(`        .body(StringBody("${escapeJava(entry.body)}"))`);
+  }
+  // De-duplicate expected status codes (observed code + common success codes)
+  const statuses = [...new Set([entry.status, 200, 201, 204])];
+  lines.push(`        .check(status().in(${statuses.join(', ')}))`);
   lines.push(`    )`);
   if (idx < filtered.length - 1) {
     lines.push(`    .pause(1, 3)`);
@@ -89,41 +97,46 @@ function renderRequest(entry, idx) {
 
 const requestBlocks = filtered.map(renderRequest).join('\n');
 
-const scala = `package simulations
+const java = `package simulations;
 
-import io.gatling.core.Predef._
-import io.gatling.http.Predef._
-import scala.concurrent.duration._
+import io.gatling.javaapi.core.*;
+import io.gatling.javaapi.http.*;
+import java.time.Duration;
+
+import static io.gatling.javaapi.core.CoreDsl.*;
+import static io.gatling.javaapi.http.HttpDsl.*;
 
 // Generated from HAR: ${path.basename(harPath)}
-class ${simulationName} extends Simulation {
+public class ${simulationName} extends Simulation {
 
-  val baseUrl: String = sys.env.getOrElse("BASE_URL", "${baseUrl}")
-  val users: Int      = sys.env.getOrElse("GATLING_USERS", "10").toInt
-  val duration: Int   = sys.env.getOrElse("GATLING_DURATION", "60").toInt
+  private final String baseUrl = System.getenv().getOrDefault("BASE_URL", "${escapeJava(baseUrl)}");
+  private final int users = Integer.parseInt(System.getenv().getOrDefault("GATLING_USERS", "10"));
+  private final int duration = Integer.parseInt(System.getenv().getOrDefault("GATLING_DURATION", "60"));
 
-  val httpProtocol = http
+  private final HttpProtocolBuilder httpProtocol = http
     .baseUrl(baseUrl)
     .acceptHeader("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
     .acceptEncodingHeader("gzip, deflate")
     .acceptLanguageHeader("en-US,en;q=0.5")
-    .userAgentHeader("Gatling/LoadTest")
+    .userAgentHeader("Gatling/LoadTest");
 
-  val journey = scenario("${simulationName}")
-${requestBlocks}
+  private final ScenarioBuilder journey = scenario("${simulationName}")
+${requestBlocks};
 
-  setUp(
-    journey.inject(
-      rampUsersPerSec(1).to(users).during(duration.seconds)
-    )
-  ).protocols(httpProtocol)
-    .assertions(
-      global.responseTime.max.lt(5000),
-      global.successfulRequests.percent.gte(95)
-    )
+  {
+    setUp(
+      journey.injectOpen(
+        rampUsersPerSec(1).to(users).during(Duration.ofSeconds(duration))
+      )
+    ).protocols(httpProtocol)
+     .assertions(
+        global().responseTime().max().lt(5000),
+        global().successfulRequests().percent().gte(95.0)
+     );
+  }
 }
 `;
 
 fs.mkdirSync(path.dirname(outPath), { recursive: true });
-fs.writeFileSync(outPath, scala, 'utf8');
+fs.writeFileSync(outPath, java, 'utf8');
 console.log(`Written: ${outPath}  (${filtered.length} requests)`);
