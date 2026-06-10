@@ -1,0 +1,55 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: gatling-run
+spec:
+  description: >
+    Compiles and runs all Gatling simulations in the workspace via Maven.
+  params:
+    - name: base-url
+      type: string
+    - name: users
+      type: string
+      default: "10"
+    - name: duration
+      type: string
+      default: "60"
+    - name: simulation-class
+      type: string
+      description: Fully qualified simulation class (empty = run all)
+      default: ""
+  workspaces:
+    - name: source
+  results:
+    - name: report-path
+      description: Absolute path to the Gatling HTML report directory
+  steps:
+    - name: run
+      image: maven:3.9-eclipse-temurin-11
+      workingDir: $(workspaces.source.path)/gatling
+      env:
+        - name: BASE_URL
+          value: $(params.base-url)
+        - name: GATLING_USERS
+          value: $(params.users)
+        - name: GATLING_DURATION
+          value: $(params.duration)
+        - name: MAVEN_OPTS
+          value: "-Xmx2g"
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        SIM_ARG=""
+        if [ -n "$(params.simulation-class)" ]; then
+          SIM_ARG="-Dgatling.simulationClass=$(params.simulation-class)"
+        fi
+        mvn -B gatling:test $SIM_ARG
+
+        # Find the most recently created report directory
+        REPORT=$(ls -dt target/gatling/*/index.html 2>/dev/null | head -1 | xargs dirname || true)
+        if [ -z "$REPORT" ]; then
+          echo "ERROR: No Gatling report found under target/gatling/"
+          exit 1
+        fi
+        echo -n "$(workspaces.source.path)/gatling/$REPORT" > $(results.report-path.path)
+        echo "Report written to: $REPORT"

@@ -1,0 +1,33 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: archive-report
+spec:
+  description: >
+    Archives the Gatling HTML report and emits a result URL (or path).
+    Extend this task to upload to S3, GCS, or an artifact server.
+  params:
+    - name: report-path
+      type: string
+      description: Absolute path to the Gatling report directory (from gatling-run result)
+  workspaces:
+    - name: source
+  results:
+    - name: report-url
+      description: URL or path where the report was archived
+  steps:
+    - name: archive
+      image: alpine:3.19
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        REPORT="$(params.report-path)"
+        if [ ! -d "$REPORT" ]; then
+          echo "ERROR: Report directory not found: $REPORT"
+          exit 1
+        fi
+        echo "=== Gatling Report Summary ==="
+        cat "$REPORT/index.html" | grep -o '<title>[^<]*</title>' || true
+        # Emit the path as the result (replace with an upload command for remote storage)
+        echo -n "$REPORT" > $(results.report-url.path)
+        echo "Report available at: $REPORT"

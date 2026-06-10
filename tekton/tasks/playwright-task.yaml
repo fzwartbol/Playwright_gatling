@@ -1,0 +1,43 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: playwright-record-har
+spec:
+  description: >
+    Runs Playwright tests against BASE_URL and records HAR files to the shared workspace.
+  params:
+    - name: base-url
+      type: string
+      description: Application URL under test
+    - name: test-filter
+      type: string
+      description: Glob or file path passed to `playwright test` (empty = all tests)
+      default: ""
+  workspaces:
+    - name: source
+      description: Shared workspace; repo is expected at $(workspaces.source.path)
+  results:
+    - name: har-dir
+      description: Path to the directory containing recorded HAR files
+  steps:
+    - name: install
+      image: mcr.microsoft.com/playwright:v1.44.0-jammy
+      workingDir: $(workspaces.source.path)/playwright
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        npm ci
+    - name: record
+      image: mcr.microsoft.com/playwright:v1.44.0-jammy
+      workingDir: $(workspaces.source.path)/playwright
+      env:
+        - name: BASE_URL
+          value: $(params.base-url)
+        - name: HAR_URL_FILTER
+          value: "$(params.base-url)/**"
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        mkdir -p $(workspaces.source.path)/har
+        npx playwright test $(params.test-filter)
+        echo -n "$(workspaces.source.path)/har" > $(results.har-dir.path)

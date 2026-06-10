@@ -1,0 +1,24 @@
+# Playwright
+playwright/node_modules/
+playwright/dist/
+playwright/test-results/
+playwright/playwright-report/
+
+# HAR files — generated at runtime, not committed
+har/
+
+# Gatling build output
+gatling/target/
+
+# Maven
+.m2/
+*.class
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.iml
+.vscode/

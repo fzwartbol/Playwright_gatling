@@ -1,0 +1,87 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: playwright-gatling-pipeline
+spec:
+  description: >
+    Full pipeline: Playwright records HAR → har-to-gatling converts → Gatling runs → report archived.
+  params:
+    - name: base-url
+      type: string
+      description: Application under test base URL
+    - name: test-filter
+      type: string
+      default: ""
+      description: Playwright test file filter (empty = all)
+    - name: users
+      type: string
+      default: "10"
+    - name: duration
+      type: string
+      default: "60"
+    - name: simulation-class
+      type: string
+      default: ""
+  workspaces:
+    - name: shared-ws
+      description: Shared PVC mounted by all tasks
+  results:
+    - name: report-url
+      description: Path/URL of the archived Gatling report
+      value: $(tasks.archive-report.results.report-url)
+  tasks:
+    - name: record-har
+      taskRef:
+        name: playwright-record-har
+      params:
+        - name: base-url
+          value: $(params.base-url)
+        - name: test-filter
+          value: $(params.test-filter)
+      workspaces:
+        - name: source
+          workspace: shared-ws
+
+    - name: convert-har
+      taskRef:
+        name: har-to-gatling
+      runAfter:
+        - record-har
+      params:
+        - name: base-url
+          value: $(params.base-url)
+        - name: har-dir
+          value: $(tasks.record-har.results.har-dir)
+      workspaces:
+        - name: source
+          workspace: shared-ws
+
+    - name: run-gatling
+      taskRef:
+        name: gatling-run
+      runAfter:
+        - convert-har
+      params:
+        - name: base-url
+          value: $(params.base-url)
+        - name: users
+          value: $(params.users)
+        - name: duration
+          value: $(params.duration)
+        - name: simulation-class
+          value: $(params.simulation-class)
+      workspaces:
+        - name: source
+          workspace: shared-ws
+
+    - name: archive-report
+      taskRef:
+        name: archive-report
+      runAfter:
+        - run-gatling
+      params:
+        - name: report-path
+          value: $(tasks.run-gatling.results.report-path)
+      workspaces:
+        - name: source
+          workspace: shared-ws
