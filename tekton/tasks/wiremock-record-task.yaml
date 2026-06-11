@@ -7,49 +7,26 @@ spec:
     Starts WireMock as a reverse proxy in front of the real application,
     runs Playwright (Java) tests so all traffic is recorded as WireMock stubs,
     then stops recording. Stubs are persisted to the shared workspace PVC.
-
-    IMPORTANT: The real application should remain running after this task.
-    Playwright only exercises the paths it knows about. Any endpoint the app
-    calls that is not covered by a Playwright test will not be stubbed. If you
-    kill the real app before the load test, those uncovered endpoints will return
-    404s. Use the proxy-fallback-url parameter on the gatling-wiremock-run task
-    to keep the real app as a live fallback for anything not yet stubbed.
-
-    After recording, the check-coverage step reports stub coverage and writes
-    a gap report to wiremock/coverage-gaps.txt on the workspace so you can
-    identify which endpoints still need Playwright tests.
+    The gatling-wiremock-run task reads the stubs from the PVC and replays them.
   params:
     - name: real-app-url
       type: string
-      description: >
-        URL of the real application WireMock proxies to during recording.
-        E.g. http://gwt-app-service:8090 (in-cluster) or http://host.docker.internal:8090
+      description: URL of the real application WireMock proxies to (e.g. http://myapp.loadtest.svc:8080)
     - name: test-filter
       type: string
       description: Maven Surefire -Dtest filter (empty = all tests)
       default: ""
-    - name: extra-playwright-runs
-      type: string
-      default: "0"
-      description: >
-        Number of additional Playwright runs after the first. Useful when you have
-        multiple journey classes and want all of them recorded in one pipeline run.
-        Each run adds to the same stub set.
   workspaces:
     - name: source
-      description: Shared workspace; repo checked out at $(workspaces.source.path)
+      description: Shared workspace with the load-test repo checked out
   results:
     - name: stub-count
-      description: Number of WireMock stubs recorded (excluding pre-committed stubs)
-    - name: coverage-gap-count
-      description: Number of distinct URL paths requested but not yet stubbed at stop time
+      description: Number of WireMock stubs recorded
   sidecars:
     - name: wiremock
       image: wiremock/wiremock:3.5.4-alpine
       args:
         - "--port=8080"
-        # NOTE: $(workspaces.source.path) is NOT substituted in sidecar args.
-        # Tekton always mounts a workspace named 'source' at /workspace/source.
         - "--root-dir=/workspace/source/wiremock"
         - "--global-response-templating"
         - "--verbose"
@@ -66,11 +43,8 @@ spec:
       script: |
         #!/usr/bin/env sh
         set -eu
-        echo "Waiting for WireMock..."
-        until curl -sf http://localhost:8080/__admin/health > /dev/null; do
-          sleep 2
-        done
-        echo "WireMock ready. Pre-loaded stubs (from wiremock/mappings/):"
+        until curl -sf http://localhost:8080/__admin/health > /dev/null; do sleep 2; done
+        echo "WireMock ready. Pre-loaded stubs:"
         curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' || true
 
     - name: start-recording
@@ -78,7 +52,6 @@ spec:
       script: |
         #!/usr/bin/env sh
         set -eu
-        echo "Starting WireMock recording → proxy to $(params.real-app-url)"
         curl -sf -X POST http://localhost:8080/__admin/recordings/start \
           -H 'Content-Type: application/json' \
           -d '{
@@ -86,116 +59,34 @@ spec:
             "persist": true,
             "repeatsAsScenarios": false,
             "captureHeaders": {
-              "Content-Type":       {"caseInsensitive": true},
-              "X-GWT-Module-Base":  {"caseInsensitive": true},
-              "X-GWT-Permutation":  {"caseInsensitive": true}
+              "Content-Type":      {"caseInsensitive": true},
+              "X-GWT-Module-Base": {"caseInsensitive": true},
+              "X-GWT-Permutation": {"caseInsensitive": true}
             }
           }'
-        echo ""
-        echo "Recording started. ALL traffic Playwright generates will be captured."
+        echo "Recording started → $(params.real-app-url)"
 
     - name: run-playwright
       image: mcr.microsoft.com/playwright/java:v1.44.0-jammy
       workingDir: $(workspaces.source.path)/playwright
       env:
-        # Playwright hits WireMock (not the real app directly).
-        # WireMock proxies to real-app-url and records every request/response.
         - name: BASE_URL
           value: "http://localhost:8080"
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
         TEST_ARG=""
-        if [ -n "$(params.test-filter)" ]; then
-          TEST_ARG="-Dtest=$(params.test-filter)"
-        fi
-
-        # Run Playwright once (mandatory)
-        echo "=== Playwright run 1 ==="
+        [ -n "$(params.test-filter)" ] && TEST_ARG="-Dtest=$(params.test-filter)"
         mvn -B test $TEST_ARG
-
-        # Optional additional runs to capture more journey variants
-        EXTRA=$(params.extra-playwright-runs)
-        i=1
-        while [ "$i" -le "$EXTRA" ]; do
-          echo "=== Playwright run $((i+1)) (extra) ==="
-          mvn -B test $TEST_ARG
-          i=$((i+1))
-        done
 
     - name: stop-recording
       image: alpine/curl:8.7.1
       script: |
         #!/usr/bin/env sh
         set -eu
-        echo "Stopping WireMock recording..."
         curl -sf -X POST http://localhost:8080/__admin/recordings/stop
-        echo ""
-        TOTAL=$(curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' | grep -o '[0-9]*')
-        echo "Total stubs (including pre-committed): $TOTAL"
-        echo ""
-        echo "Stub files in workspace:"
-        ls $(workspaces.source.path)/wiremock/mappings/ || true
+        TOTAL=$(curl -s http://localhost:8080/__admin/mappings \
+          | grep -o '"total":[0-9]*' | grep -o '[0-9]*')
+        echo "Stubs recorded: $TOTAL"
+        ls $(workspaces.source.path)/wiremock/mappings/
         printf '%s' "$TOTAL" > $(results.stub-count.path)
-
-    - name: check-coverage
-      image: alpine/curl:8.7.1
-      script: |
-        #!/usr/bin/env sh
-        set -eu
-
-        echo "========================================================"
-        echo "  STUB COVERAGE REPORT"
-        echo "========================================================"
-        echo ""
-
-        # Fetch ALL requests WireMock proxied during recording.
-        # In recording mode every request is proxied, so this == every request
-        # the application received while Playwright was running.
-        ALL_REQUESTS=$(curl -s 'http://localhost:8080/__admin/requests?limit=1000')
-
-        # Count total proxied requests
-        TOTAL_REQ=$(printf '%s' "$ALL_REQUESTS" | grep -o '"url"' | wc -l || echo 0)
-        echo "Total requests captured in journal: $TOTAL_REQ"
-
-        # Fetch the stubs that were actually persisted
-        STUBS=$(curl -s http://localhost:8080/__admin/mappings)
-        STUB_COUNT=$(printf '%s' "$STUBS" | grep -o '"total":[0-9]*' | grep -o '[0-9]*')
-        echo "Stubs recorded: $STUB_COUNT"
-        echo ""
-
-        # ── Identify any requests that were proxied but NOT matched by a stub ──
-        # After recording stops, WireMock is in replay mode. Re-running the
-        # journal requests through the matcher reveals coverage gaps.
-        UNMATCHED=$(curl -s 'http://localhost:8080/__admin/requests/unmatched?limit=1000')
-        GAP_COUNT=$(printf '%s' "$UNMATCHED" | grep -o '"url"' | wc -l || echo 0)
-
-        echo "Requests with no matching stub (coverage gaps): $GAP_COUNT"
-
-        if [ "$GAP_COUNT" -gt 0 ]; then
-          echo ""
-          echo "⚠ The following endpoints were requested during recording but"
-          echo "  have no stub. They will return 404 in load test unless you"
-          echo "  either add more Playwright tests or use proxy-fallback-url."
-          echo ""
-          printf '%s' "$UNMATCHED" | grep -o '"url":"[^"]*"' | sort -u | sed 's/"url":"//;s/"//' | head -50
-          echo ""
-          echo "Saving gap list to wiremock/coverage-gaps.txt"
-          printf '%s' "$UNMATCHED" | grep -o '"url":"[^"]*"' | sort -u \
-            | sed 's/"url":"//;s/"//' \
-            > $(workspaces.source.path)/wiremock/coverage-gaps.txt
-        else
-          echo "✓ Full coverage — every proxied request has a matching stub."
-          echo "  The real app is not required for the load test phase."
-          printf '' > $(workspaces.source.path)/wiremock/coverage-gaps.txt
-        fi
-
-        printf '%s' "$GAP_COUNT" > $(results.coverage-gap-count.path)
-
-        echo ""
-        echo "========================================================"
-        echo "  NOTE: Do NOT stop/delete the real application yet."
-        echo "  If GAP_COUNT > 0, the gatling-wiremock-run task needs"
-        echo "  proxy-fallback-url=$(params.real-app-url) so unmatched"
-        echo "  requests are forwarded to the live app instead of 404."
-        echo "========================================================"

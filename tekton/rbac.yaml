@@ -1,0 +1,49 @@
+---
+# ServiceAccount used by all pipeline tasks.
+# The deploy-app task needs cluster-level permissions to create namespaces
+# and apply arbitrary Kubernetes resources from the app overlay.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: playwright-gatling-sa
+  namespace: tekton-pipelines  # adjust if Tekton runs in a different namespace
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: playwright-gatling-deployer
+rules:
+  # Create / manage the target namespace
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create", "update", "patch"]
+  # Standard workload types an app overlay may contain
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "secrets", "serviceaccounts",
+                "persistentvolumeclaims", "pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  # Wait / rollout status
+  - apiGroups: ["apps"]
+    resources: ["deployments/status", "statefulsets/status"]
+    verbs: ["get", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: playwright-gatling-deployer-binding
+subjects:
+  - kind: ServiceAccount
+    name: playwright-gatling-sa
+    namespace: tekton-pipelines  # must match the ServiceAccount namespace above
+roleRef:
+  kind: ClusterRole
+  name: playwright-gatling-deployer
+  apiGroup: rbac.authorization.k8s.io

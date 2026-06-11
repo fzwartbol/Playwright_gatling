@@ -124,13 +124,26 @@ mvn clean gatling:test
 mvn compile -DskipTests
 ```
 
-### Tekton
+### Tekton — WireMock pipeline (plug and play)
 ```bash
-# Apply all resources
-kubectl apply -f tekton/
-# Watch a pipeline run
+# 1. One-time cluster setup (RBAC + PVC)
+kubectl apply -f tekton/rbac.yaml
+kubectl apply -f tekton/pvc.yaml
+
+# 2. Install tasks and pipeline
+kubectl apply -f tekton/tasks/deploy-app-task.yaml
+kubectl apply -f tekton/tasks/wiremock-record-task.yaml
+kubectl apply -f tekton/tasks/gatling-wiremock-task.yaml
+kubectl apply -f tekton/pipeline-wiremock.yaml
+
+# 3. Edit pipelinerun-wiremock.yaml — set these three values:
+#      app-repo-url    your app git repo
+#      overlay-path    path to k8s manifests inside the repo
+#      app-service-name  Service name that exposes the app
+kubectl apply -f tekton/pipelinerun-wiremock.yaml
+
+# 4. Watch it run
 tkn pipelinerun logs --last -f
-# List recent runs
 tkn pipelinerun list
 ```
 
@@ -161,17 +174,17 @@ Only include requests to the **application under test** domain(s).
 
 ### WireMock pipeline (recommended for GWT/JWT/XSRF apps)
 ```
-wiremock-record → gatling-wiremock-run
+deploy-app → wiremock-record → gatling-wiremock-run
 ```
-- `wiremock-record`: WireMock sidecar as proxy, Playwright drives the real app and all traffic is recorded as stubs. Stubs written to PVC.
-- `gatling-wiremock-run`: WireMock sidecar in replay mode reads stubs from PVC, Gatling load-tests against it. Real app NOT needed.
+- `deploy-app`: clones the app repo, creates the namespace, applies the k8s overlay (Kustomize or plain YAML), waits for rollout. Emits the in-cluster service URL.
+- `wiremock-record`: WireMock sidecar as proxy, Playwright records all traffic as stubs. Stubs written to PVC.
+- `gatling-wiremock-run`: WireMock replays stubs, Gatling load-tests. Real app not needed.
 
-Deploy:
-```bash
-kubectl apply -f tekton/tasks/wiremock-record-task.yaml
-kubectl apply -f tekton/tasks/gatling-wiremock-task.yaml
-kubectl apply -f tekton/pipeline-wiremock.yaml
-kubectl apply -f tekton/pipelinerun-wiremock.yaml   # edit real-app-url first!
+Three params to set in `pipelinerun-wiremock.yaml`:
+```yaml
+- name: app-repo-url       # https://github.com/myorg/myapp
+- name: overlay-path       # k8s/overlays/loadtest
+- name: app-service-name   # myapp-service
 ```
 
 ### HAR-based pipeline (for simpler apps without complex auth)

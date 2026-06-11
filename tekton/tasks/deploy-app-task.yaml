@@ -1,0 +1,115 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy-app
+spec:
+  description: >
+    Clones the application repository, creates the target namespace,
+    and applies the Kubernetes overlay (Kustomize or plain manifests).
+    Waits for all Deployments in the namespace to become ready before
+    emitting the in-cluster service URL for subsequent tasks to use.
+  params:
+    - name: app-repo-url
+      type: string
+      description: Git URL of the application repository (https or ssh)
+    - name: app-repo-revision
+      type: string
+      default: main
+      description: Branch, tag, or commit SHA to check out
+    - name: overlay-path
+      type: string
+      description: >
+        Path within the repo to Kubernetes manifests.
+        If the directory contains a kustomization.yaml, kubectl apply -k is used.
+        Otherwise kubectl apply -f is used.
+        Examples: k8s/overlays/loadtest   deploy/   manifests/loadtest
+    - name: namespace
+      type: string
+      default: loadtest
+      description: Namespace to create and deploy into
+    - name: app-service-name
+      type: string
+      description: >
+        Name of the Kubernetes Service that exposes the application.
+        Used to build the in-cluster URL emitted as the app-url result.
+    - name: app-service-port
+      type: string
+      default: "8080"
+    - name: wait-timeout
+      type: string
+      default: "300"
+      description: Seconds to wait for Deployments to become ready
+  results:
+    - name: app-url
+      description: >
+        In-cluster URL of the deployed application,
+        e.g. http://myapp.loadtest.svc.cluster.local:8080
+        Pass this as real-app-url to the wiremock-record task.
+  steps:
+    - name: clone
+      image: alpine/git:2.43.0
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "Cloning $(params.app-repo-url) @ $(params.app-repo-revision)"
+        git clone --depth=1 --branch "$(params.app-repo-revision)" \
+          "$(params.app-repo-url)" /workspace/app-repo
+        echo "Cloned. Overlay path contents:"
+        ls /workspace/app-repo/$(params.overlay-path)
+
+    - name: create-namespace
+      image: bitnami/kubectl:1.29
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        # Idempotent: creates the namespace if it does not exist
+        kubectl create namespace "$(params.namespace)" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "Namespace $(params.namespace) is ready."
+
+    - name: deploy
+      image: bitnami/kubectl:1.29
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        OVERLAY="/workspace/app-repo/$(params.overlay-path)"
+
+        # Use kustomize if a kustomization file is present, otherwise plain apply
+        if [ -f "$OVERLAY/kustomization.yaml" ] || [ -f "$OVERLAY/kustomization.yml" ]; then
+          echo "Applying Kustomize overlay: $OVERLAY"
+          kubectl apply -k "$OVERLAY" -n "$(params.namespace)"
+        else
+          echo "Applying manifests: $OVERLAY"
+          kubectl apply -f "$OVERLAY" -n "$(params.namespace)"
+        fi
+
+    - name: wait-for-ready
+      image: bitnami/kubectl:1.29
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        NS="$(params.namespace)"
+        TIMEOUT="$(params.wait-timeout)"
+
+        echo "Waiting up to ${TIMEOUT}s for all Deployments in $NS to be ready..."
+        # List deployments and wait for each
+        DEPLOYS=$(kubectl get deployments -n "$NS" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+        if [ -z "$DEPLOYS" ]; then
+          echo "No Deployments found in $NS — checking Pods directly."
+          kubectl wait pod --all -n "$NS" \
+            --for=condition=Ready --timeout="${TIMEOUT}s"
+        else
+          for d in $DEPLOYS; do
+            echo "  Waiting for deployment/$d"
+            kubectl rollout status deployment/"$d" -n "$NS" --timeout="${TIMEOUT}s"
+          done
+        fi
+        echo "All workloads ready in namespace $NS."
+
+    - name: emit-url
+      image: alpine:3.19
+      script: |
+        #!/usr/bin/env sh
+        APP_URL="http://$(params.app-service-name).$(params.namespace).svc.cluster.local:$(params.app-service-port)"
+        echo "App URL: $APP_URL"
+        printf '%s' "$APP_URL" > $(results.app-url.path)

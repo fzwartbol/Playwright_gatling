@@ -7,50 +7,35 @@ metadata:
 spec:
   pipelineRef:
     name: wiremock-record-and-load-test
+  taskRunTemplate:
+    serviceAccountName: playwright-gatling-sa   # see tekton/rbac.yaml
   params:
-    # ── Required ───────────────────────────────────────────────────────────────
-    # URL of the real application WireMock proxies to during the record phase.
-    # In-cluster (same namespace): http://gwt-app-service:8090
-    # Local Docker (host network): http://host.docker.internal:8090
-    - name: real-app-url
-      value: "http://gwt-app-service:8090"
+    # ── App repo & overlay ──────────────────────────────────────────────────
+    - name: app-repo-url
+      value: "https://github.com/myorg/myapp"   # ← your app repo
+    - name: app-repo-revision
+      value: main
+    - name: overlay-path
+      value: "k8s/overlays/loadtest"             # ← path to your k8s manifests
+    - name: namespace
+      value: "loadtest"
+    - name: app-service-name
+      value: "myapp-service"                     # ← Service name in the overlay
+    - name: app-service-port
+      value: "8080"
 
-    # ── Proxy fallback for load test ───────────────────────────────────────────
-    # Recommended: set this to the same value as real-app-url on first few runs.
-    #
-    # WHY: Playwright only exercises the paths it knows about. Background calls
-    # (health checks, token refresh, analytics, lazy-loaded resources) may not
-    # be covered by any test. Without a fallback those requests return 404 during
-    # load test, inflating failure rates with false positives.
-    #
-    # With proxy-fallback-url set:
-    #   - Requests matching a recorded stub → served from stub (fast, deterministic)
-    #   - Requests with NO matching stub    → forwarded to real app (safe fallback)
-    #
-    # After each pipeline run, check the proxied-count pipeline result and
-    # wiremock/coverage-gaps.txt on the workspace. Add Playwright tests for the
-    # listed endpoints, re-record, and repeat until proxied-count = 0.
-    # At that point you can safely remove this parameter (empty = strict replay).
-    #
-    # ITERATION 1 (building coverage) — uncomment and set the real app URL:
-    # - name: proxy-fallback-url
-    #   value: "http://gwt-app-service:8090"
-    #
-    # STEADY STATE (full coverage) — leave proxy-fallback-url absent or empty:
-    - name: proxy-fallback-url
-      value: ""
-
-    # ── Optional overrides ─────────────────────────────────────────────────────
+    # ── Playwright filter (optional) ────────────────────────────────────────
     - name: test-filter
-      value: ""                          # empty = run all Playwright tests
-    - name: extra-playwright-runs
-      value: "0"                         # increase to 1-2 to capture more path variants
+      value: ""                                  # e.g. "GwtJourneyTest" to run one class
+
+    # ── Gatling load profile ────────────────────────────────────────────────
     - name: gatling-users
-      value: "5"
+      value: "10"
     - name: gatling-duration
-      value: "30"
+      value: "60"
     - name: simulation-class
       value: "simulations.GwtJourneySimulation"
+
   workspaces:
     - name: shared-data
       persistentVolumeClaim:

@@ -6,37 +6,46 @@ metadata:
     app: playwright-gatling
 spec:
   description: >
-    One-shot pipeline:
-      1. wiremock-record  — WireMock as reverse proxy; Playwright records all traffic as stubs.
-                            After recording, a coverage-check step reports any endpoint the real
-                            app served that was NOT captured as a stub (coverage gaps).
-      2. gatling-wiremock-run — WireMock replays stubs; Gatling drives the load test.
-                                If proxy-fallback-url is provided, any request with no matching
-                                stub is forwarded transparently to the real app instead of
-                                returning 404. After the run, proxied-count shows how many
-                                requests fell through (target: 0 = full stub coverage).
+    End-to-end load test pipeline:
+      1. deploy-app     — clones the app repo, creates the namespace, applies
+                          the Kubernetes overlay, waits for the app to be ready
+      2. wiremock-record — starts WireMock as a reverse proxy, runs Playwright
+                           to record all traffic as stubs, persists stubs to PVC
+      3. gatling-wiremock-run — replays stubs with WireMock, runs Gatling load test
 
-    Recommended lifecycle
-    ─────────────────────
-    Iteration 1: set proxy-fallback-url = real-app-url so Gatling never gets 404s.
-                 Inspect coverage-gaps.txt on the workspace. Add Playwright tests.
-    Iteration 2: re-record. proxied-count should decrease.
-    Steady state: leave proxy-fallback-url empty for strict replay. The real app
-                  can be torn down without affecting load test accuracy.
+    Point it at your repo and overlay path and it does the rest.
   params:
-    - name: real-app-url
+    # ── Application deployment ───────────────────────────────────────────────
+    - name: app-repo-url
+      type: string
+      description: Git URL of the application repository
+    - name: app-repo-revision
+      type: string
+      default: main
+      description: Branch / tag / SHA to deploy
+    - name: overlay-path
       type: string
       description: >
-        URL of the live application to proxy during recording.
-        E.g. http://gwt-app-service:8090 (in-cluster) or http://host.docker.internal:8090
+        Path within the app repo to Kubernetes manifests.
+        Kustomize overlay (contains kustomization.yaml) or plain directory.
+    - name: namespace
+      type: string
+      default: loadtest
+      description: Namespace to create and deploy the app into
+    - name: app-service-name
+      type: string
+      description: Kubernetes Service name that exposes the application
+    - name: app-service-port
+      type: string
+      default: "8080"
+
+    # ── Recording ────────────────────────────────────────────────────────────
     - name: test-filter
       type: string
       default: ""
-      description: Maven Surefire -Dtest filter passed to the Playwright step (empty = all tests)
-    - name: extra-playwright-runs
-      type: string
-      default: "0"
-      description: Extra Playwright runs to broaden stub coverage (0 = single run)
+      description: Maven Surefire -Dtest filter (empty = all Playwright tests)
+
+    # ── Load test ────────────────────────────────────────────────────────────
     - name: gatling-users
       type: string
       default: "5"
@@ -46,46 +55,56 @@ spec:
     - name: simulation-class
       type: string
       default: "simulations.GwtJourneySimulation"
-    - name: proxy-fallback-url
-      type: string
-      default: ""
-      description: >
-        Optional. Forward requests with no matching stub to this URL instead of
-        returning 404. Set to the real app URL (same as real-app-url) for the
-        first few runs while stub coverage is being built up.
-        Leave empty once all paths are stubbed to enforce pure replay.
+
   workspaces:
     - name: shared-data
-      description: PVC shared between both tasks; stubs live here between steps
+      description: PVC shared by all tasks; load-test repo and stubs live here
+
   results:
+    - name: app-url
+      description: In-cluster URL of the deployed application
+      value: $(tasks.deploy-app.results.app-url)
     - name: stub-count
       description: Number of WireMock stubs recorded
       value: $(tasks.record.results.stub-count)
-    - name: coverage-gap-count
-      description: Endpoints requested during recording but not yet stubbed
-      value: $(tasks.record.results.coverage-gap-count)
     - name: report-path
-      description: Path to the Gatling HTML report
+      description: Path to the Gatling HTML report on the workspace
       value: $(tasks.load-test.results.report-path)
     - name: success-pct
       description: Gatling global success percentage
       value: $(tasks.load-test.results.success-pct)
-    - name: proxied-count
-      description: >
-        Requests forwarded to the real app during load test (coverage gaps).
-        0 = full stub coverage; the real app can safely be taken offline.
-      value: $(tasks.load-test.results.proxied-count)
+
   tasks:
+    - name: deploy-app
+      taskRef:
+        name: deploy-app
+      params:
+        - name: app-repo-url
+          value: $(params.app-repo-url)
+        - name: app-repo-revision
+          value: $(params.app-repo-revision)
+        - name: overlay-path
+          value: $(params.overlay-path)
+        - name: namespace
+          value: $(params.namespace)
+        - name: app-service-name
+          value: $(params.app-service-name)
+        - name: app-service-port
+          value: $(params.app-service-port)
+      workspaces:
+        - name: source
+          workspace: shared-data
+
     - name: record
       taskRef:
         name: wiremock-record
+      runAfter:
+        - deploy-app
       params:
         - name: real-app-url
-          value: $(params.real-app-url)
+          value: $(tasks.deploy-app.results.app-url)
         - name: test-filter
           value: $(params.test-filter)
-        - name: extra-playwright-runs
-          value: $(params.extra-playwright-runs)
       workspaces:
         - name: source
           workspace: shared-data
@@ -102,8 +121,6 @@ spec:
           value: $(params.gatling-duration)
         - name: simulation-class
           value: $(params.simulation-class)
-        - name: proxy-fallback-url
-          value: $(params.proxy-fallback-url)
       workspaces:
         - name: source
           workspace: shared-data
