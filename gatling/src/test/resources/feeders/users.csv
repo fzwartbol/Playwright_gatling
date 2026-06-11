@@ -1,11 +1,11 @@
-username,password
-user1,pass1
-user2,pass2
-user3,pass3
-user4,pass4
-user5,pass5
-user6,pass6
-user7,pass7
-user8,pass8
-user9,pass9
-user10,pass10
+username,password,name,email,address,phone
+user1,pass1,Alice Johnson,alice.johnson@loadtest.com,12 Oak Lane,0611111111
+user2,pass2,Bob Williams,bob.williams@loadtest.com,34 Elm Street,0622222222
+user3,pass3,Carol Davis,carol.davis@loadtest.com,56 Maple Avenue,0633333333
+user4,pass4,David Martinez,david.martinez@loadtest.com,78 Pine Road,0644444444
+user5,pass5,Eva Thompson,eva.thompson@loadtest.com,90 Cedar Drive,0655555555
+user6,pass6,Frank Garcia,frank.garcia@loadtest.com,11 Birch Close,0666666666
+user7,pass7,Grace Wilson,grace.wilson@loadtest.com,22 Walnut Street,0677777777
+user8,pass8,Henry Anderson,henry.anderson@loadtest.com,33 Chestnut Lane,0688888888
+user9,pass9,Iris Taylor,iris.taylor@loadtest.com,44 Ash Grove,0699999999
+user10,pass10,Jack Brown,jack.brown@loadtest.com,55 Willow Way,0610101010
