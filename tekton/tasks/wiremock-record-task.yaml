@@ -1,0 +1,109 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: wiremock-record
+spec:
+  description: >
+    Starts WireMock as a reverse proxy in front of the real application,
+    runs Playwright (Java) tests so all traffic is recorded as WireMock stubs,
+    then stops recording. Stubs are persisted to the shared workspace PVC.
+
+    After this task completes, the real application is no longer needed.
+    The gatling-wiremock-run task reads the stubs from the PVC and replays them.
+  params:
+    - name: real-app-url
+      type: string
+      description: >
+        URL of the real application WireMock proxies to during recording.
+        E.g. http://gwt-app-service:8090 (in-cluster) or http://host.docker.internal:8090
+    - name: test-filter
+      type: string
+      description: Maven Surefire -Dtest filter (empty = all tests)
+      default: ""
+  workspaces:
+    - name: source
+      description: Shared workspace; repo checked out at $(workspaces.source.path)
+  results:
+    - name: stub-count
+      description: Number of WireMock stubs recorded
+  sidecars:
+    - name: wiremock
+      image: wiremock/wiremock:3.5.4-alpine
+      args:
+        - "--port=8080"
+        # NOTE: $(workspaces.source.path) is NOT substituted in sidecar args.
+        # Tekton always mounts a workspace named 'source' at /workspace/source.
+        - "--root-dir=/workspace/source/wiremock"
+        - "--global-response-templating"
+        - "--verbose"
+      readinessProbe:
+        httpGet:
+          path: /__admin/health
+          port: 8080
+        initialDelaySeconds: 3
+        periodSeconds: 2
+        failureThreshold: 20
+  steps:
+    - name: wait-for-wiremock
+      image: alpine/curl:8.7.1
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "Waiting for WireMock..."
+        until curl -sf http://localhost:8080/__admin/health > /dev/null; do
+          sleep 2
+        done
+        echo "WireMock ready. Loaded stubs:"
+        curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' || true
+
+    - name: start-recording
+      image: alpine/curl:8.7.1
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "Starting WireMock recording → proxy to $(params.real-app-url)"
+        curl -sf -X POST http://localhost:8080/__admin/recordings/start \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "targetBaseUrl": "$(params.real-app-url)",
+            "persist": true,
+            "repeatsAsScenarios": false,
+            "captureHeaders": {
+              "Content-Type":       {"caseInsensitive": true},
+              "X-GWT-Module-Base":  {"caseInsensitive": true},
+              "X-GWT-Permutation":  {"caseInsensitive": true}
+            }
+          }'
+        echo ""
+        echo "Recording started."
+
+    - name: run-playwright
+      image: mcr.microsoft.com/playwright/java:v1.44.0-jammy
+      workingDir: $(workspaces.source.path)/playwright
+      env:
+        # Playwright hits WireMock (not the real app directly).
+        # WireMock proxies to real-app-url and records every request/response.
+        - name: BASE_URL
+          value: "http://localhost:8080"
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        TEST_ARG=""
+        if [ -n "$(params.test-filter)" ]; then
+          TEST_ARG="-Dtest=$(params.test-filter)"
+        fi
+        mvn -B test $TEST_ARG
+
+    - name: stop-recording
+      image: alpine/curl:8.7.1
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "Stopping WireMock recording..."
+        curl -sf -X POST http://localhost:8080/__admin/recordings/stop
+        echo ""
+        TOTAL=$(curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' | grep -o '[0-9]*')
+        echo "Total stubs recorded: $TOTAL"
+        echo "Stub files in workspace:"
+        ls $(workspaces.source.path)/wiremock/mappings/ || true
+        printf '%s' "$TOTAL" > $(results.stub-count.path)

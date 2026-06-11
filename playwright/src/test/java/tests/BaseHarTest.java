@@ -45,8 +45,8 @@ public abstract class BaseHarTest {
     context = browser.newContext(new Browser.NewContextOptions()
         .setBaseURL(BASE_URL)
         .setRecordHarPath(Paths.get("../har/" + harName + ".har"))
-        // OMIT keeps response bodies out of the HAR — Gatling only needs request shape
-        .setRecordHarContent(HarContentPolicy.OMIT));
+        // EMBED captures full response payloads inline in the HAR so WireMock can replay them
+        .setRecordHarContent(HarContentPolicy.EMBED));
     page = context.newPage();
   }
 

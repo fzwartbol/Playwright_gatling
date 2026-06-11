@@ -1,0 +1,115 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: gatling-wiremock-run
+spec:
+  description: >
+    Starts WireMock in replay mode (stubs read from the shared workspace PVC),
+    runs Gatling against it, then archives the HTML report as a Tekton result.
+
+    The real application does NOT need to be running — WireMock serves all
+    responses from the stubs recorded by the wiremock-record task.
+  params:
+    - name: gatling-users
+      type: string
+      default: "5"
+      description: Target virtual users for the ramp injection
+    - name: gatling-duration
+      type: string
+      default: "30"
+      description: Ramp duration in seconds
+    - name: simulation-class
+      type: string
+      default: "simulations.GwtJourneySimulation"
+      description: Fully-qualified Gatling simulation class to run
+  workspaces:
+    - name: source
+      description: Shared workspace; stubs at $(workspaces.source.path)/wiremock/mappings/
+  results:
+    - name: report-path
+      description: Path to the Gatling HTML report inside the workspace
+    - name: success-pct
+      description: Global successful-request percentage (extracted from simulation.log)
+  sidecars:
+    - name: wiremock
+      image: wiremock/wiremock:3.5.4-alpine
+      args:
+        - "--port=8080"
+        # $(workspaces.source.path) is NOT substituted in sidecar args — hardcode path.
+        - "--root-dir=/workspace/source/wiremock"
+        - "--global-response-templating"
+        - "--verbose"
+      readinessProbe:
+        httpGet:
+          path: /__admin/health
+          port: 8080
+        initialDelaySeconds: 3
+        periodSeconds: 2
+        failureThreshold: 20
+  steps:
+    - name: wait-for-wiremock
+      image: alpine/curl:8.7.1
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "Waiting for WireMock (replay mode)..."
+        until curl -sf http://localhost:8080/__admin/health > /dev/null; do
+          sleep 2
+        done
+        echo "WireMock ready. Loaded stubs:"
+        curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' || true
+
+    - name: run-gatling
+      image: maven:3.9.6-eclipse-temurin-11
+      workingDir: $(workspaces.source.path)/gatling
+      env:
+        - name: BASE_URL
+          value: "http://localhost:8080"
+        - name: GATLING_USERS
+          value: "$(params.gatling-users)"
+        - name: GATLING_DURATION
+          value: "$(params.gatling-duration)"
+        - name: MAVEN_OPTS
+          value: "-Xmx1g"
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        mvn -B gatling:test \
+          -Dgatling.simulationClass=$(params.simulation-class)
+
+    - name: archive-report
+      image: alpine:3.19
+      workingDir: $(workspaces.source.path)/gatling
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        # Find the most recent Gatling results directory
+        REPORT_DIR=$(ls -td target/gatling/*/  2>/dev/null | head -1)
+        if [ -z "$REPORT_DIR" ]; then
+          echo "ERROR: No Gatling report found in target/gatling/"
+          exit 1
+        fi
+        echo "Report directory: $REPORT_DIR"
+
+        # Write result path
+        FULL_PATH="$(workspaces.source.path)/gatling/$REPORT_DIR"
+        printf '%s' "$FULL_PATH" > $(results.report-path.path)
+
+        # Extract success percentage from simulation.log
+        LOG="$REPORT_DIR/simulation.log"
+        if [ -f "$LOG" ]; then
+          SUCCESS=$(grep -oP 'OK \K[0-9]+(?= \()' "$LOG" | tail -1 || echo "unknown")
+          TOTAL=$(grep -oP 'total \K[0-9]+' "$LOG" | tail -1 || echo "unknown")
+          echo "Requests OK: $SUCCESS / Total: $TOTAL"
+          if [ "$TOTAL" != "0" ] && [ "$TOTAL" != "unknown" ] && [ "$SUCCESS" != "unknown" ]; then
+            PCT=$(( SUCCESS * 100 / TOTAL ))
+          else
+            PCT=0
+          fi
+          printf '%s' "$PCT" > $(results.success-pct.path)
+        else
+          printf '0' > $(results.success-pct.path)
+        fi
+
+        echo "=== Gatling summary ==="
+        cat "$REPORT_DIR/simulation.log" | grep -E "^(RUN|USER|GROUP|REQUEST|END)" | tail -20 || true

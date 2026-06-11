@@ -37,7 +37,6 @@ public class AuthenticatedTest extends BaseHarTest {
     page.navigate("/profile");
     page.waitForLoadState();
 
-    page.locator(".add-to-cart").first().click();
-    page.waitForResponse("**/api/cart");
+    page.waitForResponse("**/api/cart", () -> page.locator(".add-to-cart").first().click());
   }
 }

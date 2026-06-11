@@ -1,0 +1,74 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: wiremock-record-and-load-test
+  labels:
+    app: playwright-gatling
+spec:
+  description: >
+    One-shot pipeline:
+      1. wiremock-record  — WireMock as reverse proxy, Playwright records all traffic as stubs
+      2. gatling-wiremock-run — WireMock replays stubs, Gatling load-tests against them
+
+    The real application is only needed during step 1. After recording stops,
+    Gatling drives the load against WireMock exclusively.
+  params:
+    - name: real-app-url
+      type: string
+      description: >
+        URL of the live application to proxy during recording.
+        E.g. http://gwt-app-service:8090 (in-cluster) or http://host.docker.internal:8090
+    - name: test-filter
+      type: string
+      default: ""
+      description: Maven Surefire -Dtest filter passed to the Playwright step (empty = all tests)
+    - name: gatling-users
+      type: string
+      default: "5"
+    - name: gatling-duration
+      type: string
+      default: "30"
+    - name: simulation-class
+      type: string
+      default: "simulations.GwtJourneySimulation"
+  workspaces:
+    - name: shared-data
+      description: PVC shared between both tasks; stubs live here between steps
+  results:
+    - name: stub-count
+      description: Number of WireMock stubs recorded
+      value: $(tasks.record.results.stub-count)
+    - name: report-path
+      description: Path to the Gatling HTML report
+      value: $(tasks.load-test.results.report-path)
+    - name: success-pct
+      description: Gatling global success percentage
+      value: $(tasks.load-test.results.success-pct)
+  tasks:
+    - name: record
+      taskRef:
+        name: wiremock-record
+      params:
+        - name: real-app-url
+          value: $(params.real-app-url)
+        - name: test-filter
+          value: $(params.test-filter)
+      workspaces:
+        - name: source
+          workspace: shared-data
+
+    - name: load-test
+      taskRef:
+        name: gatling-wiremock-run
+      runAfter:
+        - record
+      params:
+        - name: gatling-users
+          value: $(params.gatling-users)
+        - name: gatling-duration
+          value: $(params.gatling-duration)
+        - name: simulation-class
+          value: $(params.simulation-class)
+      workspaces:
+        - name: source
+          workspace: shared-data

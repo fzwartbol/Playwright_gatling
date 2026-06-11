@@ -1,0 +1,30 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: wiremock-record-and-load-test-
+  labels:
+    app: playwright-gatling
+spec:
+  pipelineRef:
+    name: wiremock-record-and-load-test
+  params:
+    # ── Required ───────────────────────────────────────────────────────────────
+    # URL of the real application WireMock proxies to during the record phase.
+    # In-cluster (same namespace): http://gwt-app-service:8090
+    # Local Docker (host network): http://host.docker.internal:8090
+    - name: real-app-url
+      value: "http://gwt-app-service:8090"
+
+    # ── Optional overrides ─────────────────────────────────────────────────────
+    - name: test-filter
+      value: ""                          # empty = run all Playwright tests
+    - name: gatling-users
+      value: "5"
+    - name: gatling-duration
+      value: "30"
+    - name: simulation-class
+      value: "simulations.GwtJourneySimulation"
+  workspaces:
+    - name: shared-data
+      persistentVolumeClaim:
+        claimName: playwright-gatling-ws

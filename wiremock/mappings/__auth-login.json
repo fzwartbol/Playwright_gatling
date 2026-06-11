@@ -1,0 +1,15 @@
+{
+  "name": "POST /api/auth/login (static JWT for load testing, priority=1)",
+  "priority": 1,
+  "request": {
+    "method": "POST",
+    "urlPath": "/api/auth/login"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "{\"token\":\"eyJhbGciOiJub25lIn0.eyJzdWIiOiJsb2FkdGVzdCIsImlhdCI6MH0.DEMO\",\"xsrfToken\":\"static-xsrf-token-for-load-test\"}"
+  }
+}
