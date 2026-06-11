@@ -9,6 +9,10 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -37,6 +41,16 @@ public class GwtApp {
     // without needing the login request to reach the real app.
     private static final String DEMO_TOKEN = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJsb2FkdGVzdCIsImlhdCI6MH0.DEMO";
     private static final String DEMO_XSRF  = "static-xsrf-token-for-load-test";
+
+    // Downstream validation service — configured via env var in the loadtest overlay.
+    // The overlay sets DOWNSTREAM_SERVICE_URL=http://wiremock.<ns>.svc.cluster.local:8080
+    // so the app's outbound calls are intercepted by WireMock.
+    private static final String DOWNSTREAM_URL =
+        System.getenv().getOrDefault("DOWNSTREAM_SERVICE_URL", "");
+
+    private final HttpClient httpClient = HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_1_1)
+        .build();
 
     // ── In-memory stores ──────────────────────────────────────────────────
     // Map: token → {username, xsrfToken}
@@ -287,6 +301,24 @@ public class GwtApp {
         // Params start at index (7 + typeCount) where typeCount = int(parts[2]) - 4
         // For our fixed format they are at indices len-4, len-3, len-2 (address, phone, name)
         String confirmationId = "CONF-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
+
+        // Call downstream validation service if configured.
+        // In the loadtest overlay DOWNSTREAM_SERVICE_URL points to WireMock, which
+        // either proxies to the real validation service (recording) or replays stubs (load test).
+        if (!DOWNSTREAM_URL.isEmpty()) {
+            try {
+                HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(DOWNSTREAM_URL + "/api/validate"))
+                    .POST(HttpRequest.BodyPublishers.ofString(
+                        "{\"submissionId\":\"" + confirmationId + "\"}"))
+                    .header("Content-Type", "application/json")
+                    .build();
+                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                System.out.println("Downstream /api/validate → HTTP " + resp.statusCode() + ": " + resp.body());
+            } catch (Exception e) {
+                System.err.println("Downstream call failed: " + e.getMessage());
+            }
+        }
 
         // GWT-RPC success: //OK[<result>,1]
         return ResponseEntity.ok("//OK[\"" + confirmationId + "\",1]");

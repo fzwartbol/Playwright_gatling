@@ -1,0 +1,15 @@
+{
+  "name": "POST /api/validate (stub for load testing, priority=1)",
+  "priority": 1,
+  "request": {
+    "method": "POST",
+    "url": "/api/validate"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "{\"valid\":true,\"refId\":\"LOAD-TEST-REF\"}"
+  }
+}
