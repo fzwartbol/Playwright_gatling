@@ -4,8 +4,9 @@ playwright/target/
 # HAR files — generated at runtime, not committed
 har/
 
-# Gatling build output
+# Maven build output
 gatling/target/
+gwt-app/target/
 
 # Maven local repo cache
 .m2/
