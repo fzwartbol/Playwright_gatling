@@ -7,11 +7,22 @@ metadata:
 spec:
   description: >
     One-shot pipeline:
-      1. wiremock-record  — WireMock as reverse proxy, Playwright records all traffic as stubs
-      2. gatling-wiremock-run — WireMock replays stubs, Gatling load-tests against them
+      1. wiremock-record  — WireMock as reverse proxy; Playwright records all traffic as stubs.
+                            After recording, a coverage-check step reports any endpoint the real
+                            app served that was NOT captured as a stub (coverage gaps).
+      2. gatling-wiremock-run — WireMock replays stubs; Gatling drives the load test.
+                                If proxy-fallback-url is provided, any request with no matching
+                                stub is forwarded transparently to the real app instead of
+                                returning 404. After the run, proxied-count shows how many
+                                requests fell through (target: 0 = full stub coverage).
 
-    The real application is only needed during step 1. After recording stops,
-    Gatling drives the load against WireMock exclusively.
+    Recommended lifecycle
+    ─────────────────────
+    Iteration 1: set proxy-fallback-url = real-app-url so Gatling never gets 404s.
+                 Inspect coverage-gaps.txt on the workspace. Add Playwright tests.
+    Iteration 2: re-record. proxied-count should decrease.
+    Steady state: leave proxy-fallback-url empty for strict replay. The real app
+                  can be torn down without affecting load test accuracy.
   params:
     - name: real-app-url
       type: string
@@ -22,6 +33,10 @@ spec:
       type: string
       default: ""
       description: Maven Surefire -Dtest filter passed to the Playwright step (empty = all tests)
+    - name: extra-playwright-runs
+      type: string
+      default: "0"
+      description: Extra Playwright runs to broaden stub coverage (0 = single run)
     - name: gatling-users
       type: string
       default: "5"
@@ -31,6 +46,14 @@ spec:
     - name: simulation-class
       type: string
       default: "simulations.GwtJourneySimulation"
+    - name: proxy-fallback-url
+      type: string
+      default: ""
+      description: >
+        Optional. Forward requests with no matching stub to this URL instead of
+        returning 404. Set to the real app URL (same as real-app-url) for the
+        first few runs while stub coverage is being built up.
+        Leave empty once all paths are stubbed to enforce pure replay.
   workspaces:
     - name: shared-data
       description: PVC shared between both tasks; stubs live here between steps
@@ -38,12 +61,20 @@ spec:
     - name: stub-count
       description: Number of WireMock stubs recorded
       value: $(tasks.record.results.stub-count)
+    - name: coverage-gap-count
+      description: Endpoints requested during recording but not yet stubbed
+      value: $(tasks.record.results.coverage-gap-count)
     - name: report-path
       description: Path to the Gatling HTML report
       value: $(tasks.load-test.results.report-path)
     - name: success-pct
       description: Gatling global success percentage
       value: $(tasks.load-test.results.success-pct)
+    - name: proxied-count
+      description: >
+        Requests forwarded to the real app during load test (coverage gaps).
+        0 = full stub coverage; the real app can safely be taken offline.
+      value: $(tasks.load-test.results.proxied-count)
   tasks:
     - name: record
       taskRef:
@@ -53,6 +84,8 @@ spec:
           value: $(params.real-app-url)
         - name: test-filter
           value: $(params.test-filter)
+        - name: extra-playwright-runs
+          value: $(params.extra-playwright-runs)
       workspaces:
         - name: source
           workspace: shared-data
@@ -69,6 +102,8 @@ spec:
           value: $(params.gatling-duration)
         - name: simulation-class
           value: $(params.simulation-class)
+        - name: proxy-fallback-url
+          value: $(params.proxy-fallback-url)
       workspaces:
         - name: source
           workspace: shared-data

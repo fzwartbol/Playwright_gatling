@@ -7,8 +7,24 @@ spec:
     Starts WireMock in replay mode (stubs read from the shared workspace PVC),
     runs Gatling against it, then archives the HTML report as a Tekton result.
 
-    The real application does NOT need to be running — WireMock serves all
-    responses from the stubs recorded by the wiremock-record task.
+    Stub-first, real-app fallback
+    ─────────────────────────────
+    If proxy-fallback-url is set, any request that does NOT match a recorded stub
+    is forwarded transparently to the real application instead of returning 404.
+    This prevents spurious failures caused by endpoints that were not covered
+    during the Playwright recording phase (background calls, lazy resources, etc.).
+
+    After Gatling finishes, the task reports:
+      - How many requests were served from stubs (fast, deterministic)
+      - How many were proxied to the real app (coverage gap — add Playwright tests)
+      - The full list of un-stubbed URLs written to wiremock/coverage-gaps.txt
+
+    Recommended workflow
+    ────────────────────
+    First run:  set proxy-fallback-url to the real app. Let Gatling run.
+                Review coverage-gaps.txt. Add Playwright tests for those paths.
+    Later runs: once all gaps are covered, leave proxy-fallback-url empty
+                to enforce pure replay and detect regressions.
   params:
     - name: gatling-users
       type: string
@@ -22,6 +38,13 @@ spec:
       type: string
       default: "simulations.GwtJourneySimulation"
       description: Fully-qualified Gatling simulation class to run
+    - name: proxy-fallback-url
+      type: string
+      default: ""
+      description: >
+        Optional. URL of the real application to forward requests to when no
+        stub matches. E.g. http://gwt-app-service:8090
+        Leave empty to run in strict replay mode (404 on unmatched = test failure).
   workspaces:
     - name: source
       description: Shared workspace; stubs at $(workspaces.source.path)/wiremock/mappings/
@@ -30,6 +53,11 @@ spec:
       description: Path to the Gatling HTML report inside the workspace
     - name: success-pct
       description: Global successful-request percentage (extracted from simulation.log)
+    - name: proxied-count
+      description: >
+        Number of requests forwarded to the real app (coverage gaps).
+        0 means pure stub replay — no live app dependency.
+        Non-zero means you should add more Playwright recording for those paths.
   sidecars:
     - name: wiremock
       image: wiremock/wiremock:3.5.4-alpine
@@ -56,8 +84,62 @@ spec:
         until curl -sf http://localhost:8080/__admin/health > /dev/null; do
           sleep 2
         done
-        echo "WireMock ready. Loaded stubs:"
-        curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' || true
+        TOTAL=$(curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' | grep -o '[0-9]*')
+        echo "WireMock ready. Loaded $TOTAL stubs from workspace."
+
+    - name: configure-proxy-fallback
+      image: alpine/curl:8.7.1
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        FALLBACK="$(params.proxy-fallback-url)"
+
+        if [ -z "$FALLBACK" ]; then
+          echo "proxy-fallback-url is empty → strict replay mode."
+          echo "Any request with no matching stub will return 404."
+          echo "CATCHALL_STUB_ID=none" > /workspace/catchall-id.env
+          exit 0
+        fi
+
+        echo "proxy-fallback-url=$FALLBACK"
+        echo "Registering catch-all proxy stub (priority 9999 — lowest priority)..."
+        echo "Stubs recorded with Playwright take priority over this catch-all."
+
+        # Add a lowest-priority catch-all stub that proxies to the real app.
+        # Priority 9999 means every recorded stub (default priority 5) wins first.
+        # Only requests with NO matching stub reach this catch-all.
+        RESPONSE=$(curl -sf -X POST http://localhost:8080/__admin/mappings \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"name\": \"__catch-all-proxy-fallback\",
+            \"priority\": 9999,
+            \"request\": {
+              \"method\": \"ANY\",
+              \"urlPattern\": \".*\"
+            },
+            \"response\": {
+              \"proxyBaseUrl\": \"$FALLBACK\",
+              \"additionalProxyRequestHeaders\": {
+                \"X-WireMock-Proxied\": \"true\"
+              }
+            }
+          }")
+
+        STUB_ID=$(printf '%s' "$RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | sed 's/"id":"//;s/"//')
+        echo "Catch-all stub registered with ID: $STUB_ID"
+        printf 'CATCHALL_STUB_ID=%s\n' "$STUB_ID" > /workspace/catchall-id.env
+
+        # Verify the real app is reachable before starting load test
+        echo "Verifying real app at $FALLBACK is reachable..."
+        if curl -sf --connect-timeout 5 "$FALLBACK/" > /dev/null 2>&1 || \
+           curl -sf --connect-timeout 5 "$FALLBACK" > /dev/null 2>&1; then
+          echo "✓ Real app is reachable — proxy fallback is active."
+        else
+          echo "⚠ WARNING: Real app at $FALLBACK did not respond."
+          echo "  Unmatched requests during load test will fail."
+          echo "  Ensure the service is running if stub coverage is incomplete."
+        fi
 
     - name: run-gatling
       image: maven:3.9.6-eclipse-temurin-11
@@ -77,39 +159,126 @@ spec:
         mvn -B gatling:test \
           -Dgatling.simulationClass=$(params.simulation-class)
 
+    - name: coverage-report
+      image: alpine/curl:8.7.1
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        # Load the catch-all stub ID written by configure-proxy-fallback
+        . /workspace/catchall-id.env
+
+        echo "========================================================"
+        echo "  LOAD TEST STUB COVERAGE REPORT"
+        echo "========================================================"
+        echo ""
+
+        if [ "$CATCHALL_STUB_ID" = "none" ]; then
+          echo "Mode: strict replay (no proxy fallback configured)"
+          echo ""
+          UNMATCHED=$(curl -s 'http://localhost:8080/__admin/requests/unmatched?limit=1000')
+          GAP_COUNT=$(printf '%s' "$UNMATCHED" | grep -o '"url"' | wc -l || echo 0)
+          echo "Requests with no stub match: $GAP_COUNT"
+          if [ "$GAP_COUNT" -gt 0 ]; then
+            echo "These returned 404 during the load test:"
+            printf '%s' "$UNMATCHED" | grep -o '"url":"[^"]*"' | sort -u \
+              | sed 's/"url":"//;s/"//' | head -30
+          fi
+          printf '%s' "$GAP_COUNT" > $(results.proxied-count.path)
+        else
+          echo "Mode: stub-first with proxy fallback (catch-all stub ID: $CATCHALL_STUB_ID)"
+          echo ""
+
+          # Count requests served by the catch-all (= proxied to real app)
+          ALL_REQS=$(curl -s 'http://localhost:8080/__admin/requests?limit=5000')
+          PROXIED_COUNT=$(printf '%s' "$ALL_REQS" \
+            | grep -c "\"$CATCHALL_STUB_ID\"" || echo 0)
+
+          TOTAL_COUNT=$(printf '%s' "$ALL_REQS" | grep -o '"url"' | wc -l || echo 0)
+          STUBBED_COUNT=$(( TOTAL_COUNT - PROXIED_COUNT ))
+
+          echo "Total requests during load test : $TOTAL_COUNT"
+          echo "Served from recorded stubs      : $STUBBED_COUNT"
+          echo "Proxied to real app (gaps)      : $PROXIED_COUNT"
+          echo ""
+
+          printf '%s' "$PROXIED_COUNT" > $(results.proxied-count.path)
+
+          if [ "$PROXIED_COUNT" -gt 0 ]; then
+            echo "⚠ The following endpoints were NOT stubbed and fell through to the real app."
+            echo "  Add Playwright tests for these paths and re-run the record task to close the gaps."
+            echo ""
+
+            # Extract URLs from proxied requests by correlating stub mapping ID
+            printf '%s' "$ALL_REQS" \
+              | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+catchall = '$CATCHALL_STUB_ID'
+gaps = set()
+for req in d.get('requests', []):
+    if req.get('stubMapping', {}).get('id') == catchall:
+        r = req.get('request', {})
+        gaps.add(r.get('method','?') + ' ' + r.get('url','?'))
+for g in sorted(gaps):
+    print(' ', g)
+" 2>/dev/null || \
+            printf '%s' "$ALL_REQS" | grep -B5 "\"$CATCHALL_STUB_ID\"" \
+              | grep '"url"' | sort -u | sed 's/.*"url":"\(.*\)".*/  \1/' | head -30
+
+            echo ""
+            # Save gap list to workspace for inspection
+            printf '%s' "$ALL_REQS" \
+              | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+catchall = '$CATCHALL_STUB_ID'
+gaps = set()
+for req in d.get('requests', []):
+    if req.get('stubMapping', {}).get('id') == catchall:
+        r = req.get('request', {})
+        gaps.add(r.get('method','?') + ' ' + r.get('url','?'))
+for g in sorted(gaps):
+    print(g)
+" 2>/dev/null > $(workspaces.source.path)/wiremock/coverage-gaps.txt || true
+
+            echo "Full gap list saved to wiremock/coverage-gaps.txt on the workspace."
+          else
+            echo "✓ 100% stub coverage — no requests were proxied to the real app."
+            echo "  The real application is not required for future load test runs."
+            printf '' > $(workspaces.source.path)/wiremock/coverage-gaps.txt
+          fi
+        fi
+
+        echo ""
+        echo "========================================================"
+
     - name: archive-report
       image: alpine:3.19
       workingDir: $(workspaces.source.path)/gatling
       script: |
         #!/usr/bin/env sh
         set -eu
-        # Find the most recent Gatling results directory
         REPORT_DIR=$(ls -td target/gatling/*/  2>/dev/null | head -1)
         if [ -z "$REPORT_DIR" ]; then
           echo "ERROR: No Gatling report found in target/gatling/"
           exit 1
         fi
         echo "Report directory: $REPORT_DIR"
-
-        # Write result path
         FULL_PATH="$(workspaces.source.path)/gatling/$REPORT_DIR"
         printf '%s' "$FULL_PATH" > $(results.report-path.path)
 
-        # Extract success percentage from simulation.log
         LOG="$REPORT_DIR/simulation.log"
         if [ -f "$LOG" ]; then
-          SUCCESS=$(grep -oP 'OK \K[0-9]+(?= \()' "$LOG" | tail -1 || echo "unknown")
-          TOTAL=$(grep -oP 'total \K[0-9]+' "$LOG" | tail -1 || echo "unknown")
-          echo "Requests OK: $SUCCESS / Total: $TOTAL"
-          if [ "$TOTAL" != "0" ] && [ "$TOTAL" != "unknown" ] && [ "$SUCCESS" != "unknown" ]; then
+          SUCCESS=$(grep -oP 'OK \K[0-9]+(?= \()' "$LOG" | tail -1 || echo "0")
+          TOTAL=$(grep -oP 'total \K[0-9]+' "$LOG" | tail -1 || echo "0")
+          if [ "$TOTAL" != "0" ] && [ "$TOTAL" != "" ]; then
             PCT=$(( SUCCESS * 100 / TOTAL ))
           else
             PCT=0
           fi
           printf '%s' "$PCT" > $(results.success-pct.path)
+          echo "Requests: $SUCCESS OK / $TOTAL total ($PCT%)"
         else
           printf '0' > $(results.success-pct.path)
         fi
-
-        echo "=== Gatling summary ==="
-        cat "$REPORT_DIR/simulation.log" | grep -E "^(RUN|USER|GROUP|REQUEST|END)" | tail -20 || true

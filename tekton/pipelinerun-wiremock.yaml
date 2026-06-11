@@ -15,9 +15,36 @@ spec:
     - name: real-app-url
       value: "http://gwt-app-service:8090"
 
+    # ── Proxy fallback for load test ───────────────────────────────────────────
+    # Recommended: set this to the same value as real-app-url on first few runs.
+    #
+    # WHY: Playwright only exercises the paths it knows about. Background calls
+    # (health checks, token refresh, analytics, lazy-loaded resources) may not
+    # be covered by any test. Without a fallback those requests return 404 during
+    # load test, inflating failure rates with false positives.
+    #
+    # With proxy-fallback-url set:
+    #   - Requests matching a recorded stub → served from stub (fast, deterministic)
+    #   - Requests with NO matching stub    → forwarded to real app (safe fallback)
+    #
+    # After each pipeline run, check the proxied-count pipeline result and
+    # wiremock/coverage-gaps.txt on the workspace. Add Playwright tests for the
+    # listed endpoints, re-record, and repeat until proxied-count = 0.
+    # At that point you can safely remove this parameter (empty = strict replay).
+    #
+    # ITERATION 1 (building coverage) — uncomment and set the real app URL:
+    # - name: proxy-fallback-url
+    #   value: "http://gwt-app-service:8090"
+    #
+    # STEADY STATE (full coverage) — leave proxy-fallback-url absent or empty:
+    - name: proxy-fallback-url
+      value: ""
+
     # ── Optional overrides ─────────────────────────────────────────────────────
     - name: test-filter
       value: ""                          # empty = run all Playwright tests
+    - name: extra-playwright-runs
+      value: "0"                         # increase to 1-2 to capture more path variants
     - name: gatling-users
       value: "5"
     - name: gatling-duration
