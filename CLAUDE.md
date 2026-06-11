@@ -173,19 +173,54 @@ Only include requests to the **application under test** domain(s).
 ## Tekton Pipeline Topology
 
 ### WireMock pipeline (recommended for GWT/JWT/XSRF apps)
-```
-deploy-app → wiremock-record → gatling-wiremock-run
-```
-- `deploy-app`: clones the app repo, creates the namespace, applies the k8s overlay (Kustomize or plain YAML), waits for rollout. Emits the in-cluster service URL.
-- `wiremock-record`: WireMock sidecar as proxy, Playwright records all traffic as stubs. Stubs written to PVC.
-- `gatling-wiremock-run`: WireMock replays stubs, Gatling load-tests. Real app not needed.
 
-Three params to set in `pipelinerun-wiremock.yaml`:
-```yaml
-- name: app-repo-url       # https://github.com/myorg/myapp
-- name: overlay-path       # k8s/overlays/loadtest
-- name: app-service-name   # myapp-service
+**Architecture — WireMock sits between the app and its downstream dependencies:**
+
 ```
+Recording:   Playwright → real app → WireMock (proxy) → real downstream services
+Load test:   Gatling    → real app → WireMock (replay) → [stubs, no live services]
+```
+
+Gatling measures the **real application's** throughput and latency. Downstream
+services (payment APIs, user services, etc.) are served from recorded stubs so
+they are never hit under load and don't need to be available.
+
+**Pipeline steps:**
+```
+fetch-loadtest-repo  ──┐
+                       ├──► record ──► load-test
+deploy-wiremock     ──┤
+deploy-app          ──┘
+```
+
+- `fetch-loadtest-repo`: clones this repo (playwright/, gatling/, wiremock/mappings/) onto the PVC
+- `deploy-wiremock`: deploys WireMock as a K8s Deployment+Service; mounts the same PVC so pre-committed stubs are immediately available
+- `deploy-app`: clones the app repo, creates namespace, applies overlay. **The overlay must configure the app's downstream service URLs to point to `http://wiremock.<namespace>.svc.cluster.local:8080`**
+- `record`: starts WireMock recording → Playwright drives real app → app's outbound calls captured as stubs → recording stopped
+- `load-test`: Gatling drives the real app; app calls WireMock which replays stubs
+
+**Params to set in `pipelinerun-wiremock.yaml`:**
+```yaml
+- name: loadtest-repo-url      # this repo
+- name: app-repo-url           # your app repo
+- name: overlay-path           # k8s/overlays/loadtest
+- name: app-service-name       # Service name in the overlay
+- name: downstream-base-url    # the real downstream service WireMock proxies to
+```
+
+**App overlay requirement** — route outbound calls to WireMock:
+```yaml
+# In your app's loadtest Kustomize overlay or deployment patch:
+env:
+  - name: PAYMENT_API_URL
+    value: "http://wiremock.loadtest.svc.cluster.local:8080"
+  - name: USER_SERVICE_URL
+    value: "http://wiremock.loadtest.svc.cluster.local:8080"
+```
+
+**PVC requirement** — ReadWriteMany (RWX):
+WireMock K8s pod and Tekton task pods mount the same PVC simultaneously.
+Use a storage class that supports RWX: NFS, CephFS, Azure Files, AWS EFS, GCP Filestore.
 
 ### HAR-based pipeline (for simpler apps without complex auth)
 ```

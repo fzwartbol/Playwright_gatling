@@ -3,8 +3,14 @@ kind: PersistentVolumeClaim
 metadata:
   name: playwright-gatling-ws
 spec:
+  # ReadWriteMany is required: the WireMock Deployment pod and Tekton task
+  # pods must mount this PVC simultaneously during record and load-test phases.
+  # Use a storage class that supports RWX: NFS, CephFS, Azure Files, AWS EFS,
+  # GCP Filestore, etc.  Most managed Kubernetes offerings have one available.
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
   resources:
     requests:
-      storage: 2Gi
+      storage: 5Gi
+  # Uncomment and set your RWX storage class if the default does not support it:
+  # storageClassName: nfs-client

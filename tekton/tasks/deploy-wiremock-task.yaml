@@ -1,0 +1,150 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy-wiremock
+spec:
+  description: >
+    Deploys WireMock as a Kubernetes Deployment + Service in the target namespace.
+
+    WireMock's role in this pipeline
+    ──────────────────────────────────
+    WireMock sits between the APPLICATION and its DOWNSTREAM DEPENDENCIES
+    (external APIs, databases over HTTP, partner services, etc.).
+
+    The application overlay must be configured to route its outbound service
+    calls to the WireMock Service URL instead of the real downstream services:
+
+      http://wiremock.<namespace>.svc.cluster.local:8080
+
+    Recording phase  (wiremock-record task):
+      Playwright → real app → WireMock (proxy) → real downstream services
+      WireMock captures every request/response pair as a stub.
+
+    Load test phase  (gatling-run task):
+      Gatling → real app → WireMock (replay stubs) → [no real services needed]
+      Gatling measures the real app's throughput and latency.
+
+    Storage
+    ────────
+    WireMock mounts the shared workspace PVC at /workspace/source so it reads
+    the pre-committed stubs in wiremock/mappings/ (e.g. __auth-login.json) and
+    writes newly recorded stubs to the same directory. Tekton tasks mount the
+    same PVC at the same path, so stubs are shared automatically.
+    The PVC must support ReadWriteMany (see pvc.yaml).
+  params:
+    - name: namespace
+      type: string
+      description: Namespace to deploy WireMock into (same as the app namespace)
+    - name: pvc-name
+      type: string
+      default: playwright-gatling-ws
+      description: Name of the shared workspace PVC
+    - name: wait-timeout
+      type: string
+      default: "120"
+  results:
+    - name: wiremock-url
+      description: In-cluster base URL of the WireMock service
+  steps:
+    - name: deploy
+      image: bitnami/kubectl:1.29
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        NS="$(params.namespace)"
+        PVC="$(params.pvc-name)"
+
+        echo "Deploying WireMock to namespace: $NS"
+
+        kubectl apply -n "$NS" -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: wiremock
+          namespace: $NS
+          labels:
+            app: wiremock
+            managed-by: playwright-gatling-pipeline
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: wiremock
+          template:
+            metadata:
+              labels:
+                app: wiremock
+            spec:
+              containers:
+                - name: wiremock
+                  image: wiremock/wiremock:3.5.4-alpine
+                  args:
+                    - "--port=8080"
+                    # Mount path matches Tekton workspace path so stubs are shared.
+                    - "--root-dir=/workspace/source/wiremock"
+                    - "--global-response-templating"
+                    - "--verbose"
+                  ports:
+                    - containerPort: 8080
+                  readinessProbe:
+                    httpGet:
+                      path: /__admin/health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 3
+                    failureThreshold: 20
+                  volumeMounts:
+                    - name: workspace
+                      mountPath: /workspace/source
+              volumes:
+                - name: workspace
+                  persistentVolumeClaim:
+                    claimName: $PVC
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: wiremock
+          namespace: $NS
+          labels:
+            app: wiremock
+            managed-by: playwright-gatling-pipeline
+        spec:
+          selector:
+            app: wiremock
+          ports:
+            - name: http
+              port: 8080
+              targetPort: 8080
+        EOF
+
+    - name: wait-ready
+      image: bitnami/kubectl:1.29
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "Waiting for WireMock deployment..."
+        kubectl rollout status deployment/wiremock \
+          -n "$(params.namespace)" \
+          --timeout="$(params.wait-timeout)s"
+        echo "WireMock ready."
+
+    - name: verify-and-emit-url
+      image: alpine/curl:8.7.1
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        NS="$(params.namespace)"
+        URL="http://wiremock.$NS.svc.cluster.local:8080"
+
+        echo "Verifying WireMock at $URL ..."
+        until curl -sf "$URL/__admin/health" > /dev/null; do
+          echo "  waiting..."
+          sleep 3
+        done
+
+        echo "WireMock healthy. Loaded stubs:"
+        curl -s "$URL/__admin/mappings" | grep -o '"total":[0-9]*' || true
+
+        printf '%s' "$URL" > $(results.wiremock-url.path)
+        echo "wiremock-url = $URL"

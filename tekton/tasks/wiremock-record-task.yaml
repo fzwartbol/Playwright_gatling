@@ -4,74 +4,94 @@ metadata:
   name: wiremock-record
 spec:
   description: >
-    Starts WireMock as a reverse proxy in front of the real application,
-    runs Playwright (Java) tests so all traffic is recorded as WireMock stubs,
-    then stops recording. Stubs are persisted to the shared workspace PVC.
-    The gatling-wiremock-run task reads the stubs from the PVC and replays them.
+    Drives Playwright against the real application while WireMock (already
+    running as a Kubernetes Service) proxies and records every outbound call
+    the app makes to downstream services.
+
+    Traffic flow during recording:
+      Playwright → real app → WireMock (proxy mode) → real downstream services
+
+    After this task, WireMock's mappings/ directory on the shared PVC contains
+    a stub for every downstream request the app made. The gatling-run task then
+    replays those stubs under load without needing the real downstream services.
+
+    Prerequisites
+    ─────────────
+    1. The app must be configured (via its overlay) to route outbound service
+       calls to the WireMock Service URL, e.g.:
+         PAYMENT_API_URL=http://wiremock.<namespace>.svc.cluster.local:8080
+    2. The deploy-wiremock task must have run first.
+    3. downstream-base-url must be the URL of the REAL downstream service that
+       WireMock will proxy to during recording.
+       For multiple downstream services, either:
+         a) Route all of them through a single WireMock instance with path prefixes
+         b) Run this task once per service with different test-filter values
   params:
-    - name: real-app-url
+    - name: wiremock-url
       type: string
-      description: URL of the real application WireMock proxies to (e.g. http://myapp.loadtest.svc:8080)
+      description: >
+        Base URL of the WireMock Kubernetes Service.
+        E.g. http://wiremock.loadtest.svc.cluster.local:8080
+        Passed from deploy-wiremock task result.
+    - name: app-url
+      type: string
+      description: >
+        URL of the real application that Playwright will drive.
+        E.g. http://myapp.loadtest.svc.cluster.local:8080
+        Passed from deploy-app task result.
+    - name: downstream-base-url
+      type: string
+      description: >
+        URL of the real downstream service WireMock proxies to during recording.
+        E.g. https://api.payments.example.com or http://user-service.prod:8080
+        This is the service the app calls, whose responses you want to stub.
     - name: test-filter
       type: string
-      description: Maven Surefire -Dtest filter (empty = all tests)
       default: ""
+      description: Maven Surefire -Dtest filter (empty = all Playwright tests)
   workspaces:
     - name: source
-      description: Shared workspace with the load-test repo checked out
+      description: Shared workspace with load-test repo (playwright/, wiremock/)
   results:
     - name: stub-count
-      description: Number of WireMock stubs recorded
-  sidecars:
-    - name: wiremock
-      image: wiremock/wiremock:3.5.4-alpine
-      args:
-        - "--port=8080"
-        - "--root-dir=/workspace/source/wiremock"
-        - "--global-response-templating"
-        - "--verbose"
-      readinessProbe:
-        httpGet:
-          path: /__admin/health
-          port: 8080
-        initialDelaySeconds: 3
-        periodSeconds: 2
-        failureThreshold: 20
+      description: Number of stubs recorded (total including pre-committed)
   steps:
-    - name: wait-for-wiremock
-      image: alpine/curl:8.7.1
-      script: |
-        #!/usr/bin/env sh
-        set -eu
-        until curl -sf http://localhost:8080/__admin/health > /dev/null; do sleep 2; done
-        echo "WireMock ready. Pre-loaded stubs:"
-        curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' || true
-
     - name: start-recording
       image: alpine/curl:8.7.1
       script: |
         #!/usr/bin/env sh
         set -eu
-        curl -sf -X POST http://localhost:8080/__admin/recordings/start \
+        WM="$(params.wiremock-url)"
+
+        echo "Starting WireMock recording"
+        echo "  WireMock admin : $WM"
+        echo "  Proxying to    : $(params.downstream-base-url)"
+        echo ""
+
+        curl -sf -X POST "$WM/__admin/recordings/start" \
           -H 'Content-Type: application/json' \
-          -d '{
-            "targetBaseUrl": "$(params.real-app-url)",
-            "persist": true,
-            "repeatsAsScenarios": false,
-            "captureHeaders": {
-              "Content-Type":      {"caseInsensitive": true},
-              "X-GWT-Module-Base": {"caseInsensitive": true},
-              "X-GWT-Permutation": {"caseInsensitive": true}
+          -d "{
+            \"targetBaseUrl\": \"$(params.downstream-base-url)\",
+            \"persist\": true,
+            \"repeatsAsScenarios\": false,
+            \"captureHeaders\": {
+              \"Content-Type\":      {\"caseInsensitive\": true},
+              \"Authorization\":     {\"caseInsensitive\": true},
+              \"X-GWT-Module-Base\": {\"caseInsensitive\": true},
+              \"X-GWT-Permutation\": {\"caseInsensitive\": true}
             }
-          }'
-        echo "Recording started → $(params.real-app-url)"
+          }"
+        echo ""
+        echo "Recording started."
 
     - name: run-playwright
       image: mcr.microsoft.com/playwright/java:v1.44.0-jammy
       workingDir: $(workspaces.source.path)/playwright
       env:
+        # Playwright drives the REAL application — not WireMock directly.
+        # The app's outbound calls go to WireMock (configured via the overlay).
         - name: BASE_URL
-          value: "http://localhost:8080"
+          value: "$(params.app-url)"
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
@@ -84,9 +104,17 @@ spec:
       script: |
         #!/usr/bin/env sh
         set -eu
-        curl -sf -X POST http://localhost:8080/__admin/recordings/stop
-        TOTAL=$(curl -s http://localhost:8080/__admin/mappings \
+        WM="$(params.wiremock-url)"
+
+        echo "Stopping WireMock recording..."
+        curl -sf -X POST "$WM/__admin/recordings/stop"
+        echo ""
+
+        TOTAL=$(curl -s "$WM/__admin/mappings" \
           | grep -o '"total":[0-9]*' | grep -o '[0-9]*')
-        echo "Stubs recorded: $TOTAL"
+        echo "Total stubs (including pre-committed): $TOTAL"
+        echo ""
+        echo "Stub files recorded:"
         ls $(workspaces.source.path)/wiremock/mappings/
+
         printf '%s' "$TOTAL" > $(results.stub-count.path)

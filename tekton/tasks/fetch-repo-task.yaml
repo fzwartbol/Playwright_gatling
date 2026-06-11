@@ -1,0 +1,41 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: fetch-repo
+spec:
+  description: >
+    Clones a git repository onto the shared workspace.
+    Used as the first pipeline step to put the load-test repo
+    (playwright/, gatling/, wiremock/mappings/) onto the PVC so
+    subsequent tasks and the WireMock Deployment can access it.
+  params:
+    - name: url
+      type: string
+      description: Git repository URL (https or ssh)
+    - name: revision
+      type: string
+      default: main
+      description: Branch, tag, or commit SHA
+    - name: subdirectory
+      type: string
+      default: ""
+      description: >
+        Clone into this subdirectory of the workspace (default: workspace root).
+        Use "app" when cloning the app repo alongside the load-test repo.
+  workspaces:
+    - name: output
+  steps:
+    - name: clone
+      image: alpine/git:2.43.0
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        DEST="$(workspaces.output.path)"
+        if [ -n "$(params.subdirectory)" ]; then
+          DEST="$DEST/$(params.subdirectory)"
+          mkdir -p "$DEST"
+        fi
+        echo "Cloning $(params.url) @ $(params.revision) → $DEST"
+        git clone --depth=1 --branch "$(params.revision)" "$(params.url)" "$DEST"
+        echo "Done. Contents:"
+        ls "$DEST"

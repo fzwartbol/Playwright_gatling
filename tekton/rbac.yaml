@@ -1,7 +1,4 @@
 ---
-# ServiceAccount used by all pipeline tasks.
-# The deploy-app task needs cluster-level permissions to create namespaces
-# and apply arbitrary Kubernetes resources from the app overlay.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -18,10 +15,11 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "create", "update", "patch"]
-  # Standard workload types an app overlay may contain
+  # Workload types (app overlay + WireMock Deployment)
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Services, config, secrets, PVCs
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts",
                 "persistentvolumeclaims", "pods"]
@@ -29,7 +27,7 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "create", "update", "patch", "delete"]
-  # Wait / rollout status
+  # Rollout status checks
   - apiGroups: ["apps"]
     resources: ["deployments/status", "statefulsets/status"]
     verbs: ["get", "watch"]
@@ -42,7 +40,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: playwright-gatling-sa
-    namespace: tekton-pipelines  # must match the ServiceAccount namespace above
+    namespace: tekton-pipelines
 roleRef:
   kind: ClusterRole
   name: playwright-gatling-deployer

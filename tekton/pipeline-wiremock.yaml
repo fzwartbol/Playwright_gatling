@@ -6,32 +6,54 @@ metadata:
     app: playwright-gatling
 spec:
   description: >
-    End-to-end load test pipeline:
-      1. deploy-app     — clones the app repo, creates the namespace, applies
-                          the Kubernetes overlay, waits for the app to be ready
-      2. wiremock-record — starts WireMock as a reverse proxy, runs Playwright
-                           to record all traffic as stubs, persists stubs to PVC
-      3. gatling-wiremock-run — replays stubs with WireMock, runs Gatling load test
+    End-to-end load test pipeline. Point it at your app repo + overlay and it
+    does everything: clone repos, create namespace, deploy WireMock and the app,
+    record downstream stubs, run load test.
 
-    Point it at your repo and overlay path and it does the rest.
+    Architecture
+    ─────────────
+    WireMock sits between the APPLICATION and its DOWNSTREAM DEPENDENCIES.
+    The app overlay must configure outbound service URLs to point to WireMock:
+      http://wiremock.<namespace>.svc.cluster.local:8080
+
+    Recording:  Playwright  →  real app  →  WireMock (proxy)  →  real downstream
+    Load test:  Gatling     →  real app  →  WireMock (replay) →  [stubs only]
+
+    Gatling measures real application performance. Downstream services are never
+    hit under load — WireMock replays the stubs recorded during the Playwright run.
+
+    Steps
+    ──────
+    1. fetch-loadtest-repo  Clone the load-test repo (playwright/, gatling/, stubs)
+    2. deploy-wiremock      Deploy WireMock as a K8s Service in the namespace
+    3. deploy-app           Clone the app repo, apply overlay, wait for rollout
+    4. record               Start WireMock recording, run Playwright, stop recording
+    5. load-test            Gatling → real app (app calls WireMock stubs)
   params:
-    # ── Application deployment ───────────────────────────────────────────────
+    # ── Load test repo (this repo) ────────────────────────────────────────────
+    - name: loadtest-repo-url
+      type: string
+      description: Git URL of this load-test repository (playwright + gatling + stubs)
+    - name: loadtest-repo-revision
+      type: string
+      default: main
+
+    # ── Application to test ───────────────────────────────────────────────────
     - name: app-repo-url
       type: string
       description: Git URL of the application repository
     - name: app-repo-revision
       type: string
       default: main
-      description: Branch / tag / SHA to deploy
     - name: overlay-path
       type: string
       description: >
         Path within the app repo to Kubernetes manifests.
-        Kustomize overlay (contains kustomization.yaml) or plain directory.
+        The overlay MUST configure the app's downstream service URLs to point
+        to http://wiremock.<namespace>.svc.cluster.local:8080
     - name: namespace
       type: string
       default: loadtest
-      description: Namespace to create and deploy the app into
     - name: app-service-name
       type: string
       description: Kubernetes Service name that exposes the application
@@ -39,45 +61,87 @@ spec:
       type: string
       default: "8080"
 
-    # ── Recording ────────────────────────────────────────────────────────────
+    # ── WireMock recording ────────────────────────────────────────────────────
+    - name: downstream-base-url
+      type: string
+      description: >
+        URL of the REAL downstream service WireMock proxies to during recording.
+        E.g. https://api.payments.example.com or http://user-svc.prod.svc:8080
+        This is what the app normally calls; WireMock captures all responses.
+
+    # ── Playwright ────────────────────────────────────────────────────────────
     - name: test-filter
       type: string
       default: ""
-      description: Maven Surefire -Dtest filter (empty = all Playwright tests)
+      description: Maven Surefire -Dtest filter (empty = all tests)
 
-    # ── Load test ────────────────────────────────────────────────────────────
+    # ── Gatling ───────────────────────────────────────────────────────────────
     - name: gatling-users
       type: string
-      default: "5"
+      default: "10"
     - name: gatling-duration
       type: string
-      default: "30"
+      default: "60"
     - name: simulation-class
       type: string
       default: "simulations.GwtJourneySimulation"
 
   workspaces:
     - name: shared-data
-      description: PVC shared by all tasks; load-test repo and stubs live here
+      description: >
+        ReadWriteMany PVC shared by all tasks AND the WireMock Deployment pod.
+        The WireMock K8s pod mounts this PVC at /workspace/source so it reads
+        pre-committed stubs and writes newly recorded stubs to the same path
+        that Tekton tasks use.
 
   results:
+    - name: wiremock-url
+      value: $(tasks.deploy-wiremock.results.wiremock-url)
     - name: app-url
-      description: In-cluster URL of the deployed application
       value: $(tasks.deploy-app.results.app-url)
     - name: stub-count
-      description: Number of WireMock stubs recorded
       value: $(tasks.record.results.stub-count)
     - name: report-path
-      description: Path to the Gatling HTML report on the workspace
       value: $(tasks.load-test.results.report-path)
     - name: success-pct
-      description: Gatling global success percentage
       value: $(tasks.load-test.results.success-pct)
 
   tasks:
+    # ── 1. Clone load-test repo ───────────────────────────────────────────────
+    - name: fetch-loadtest-repo
+      taskRef:
+        name: fetch-repo
+      params:
+        - name: url
+          value: $(params.loadtest-repo-url)
+        - name: revision
+          value: $(params.loadtest-repo-revision)
+      workspaces:
+        - name: output
+          workspace: shared-data
+
+    # ── 2. Deploy WireMock as K8s Service ────────────────────────────────────
+    # Runs after fetch so pre-committed stubs (wiremock/mappings/) are on the
+    # PVC before the WireMock pod starts.
+    - name: deploy-wiremock
+      taskRef:
+        name: deploy-wiremock
+      runAfter:
+        - fetch-loadtest-repo
+      params:
+        - name: namespace
+          value: $(params.namespace)
+      workspaces:
+        - name: source
+          workspace: shared-data
+
+    # ── 3. Deploy the application under test ─────────────────────────────────
+    # Can run in parallel with deploy-wiremock since they are independent.
     - name: deploy-app
       taskRef:
         name: deploy-app
+      runAfter:
+        - fetch-loadtest-repo
       params:
         - name: app-repo-url
           value: $(params.app-repo-url)
@@ -95,26 +159,35 @@ spec:
         - name: source
           workspace: shared-data
 
+    # ── 4. Record stubs ───────────────────────────────────────────────────────
     - name: record
       taskRef:
         name: wiremock-record
       runAfter:
+        - deploy-wiremock
         - deploy-app
       params:
-        - name: real-app-url
+        - name: wiremock-url
+          value: $(tasks.deploy-wiremock.results.wiremock-url)
+        - name: app-url
           value: $(tasks.deploy-app.results.app-url)
+        - name: downstream-base-url
+          value: $(params.downstream-base-url)
         - name: test-filter
           value: $(params.test-filter)
       workspaces:
         - name: source
           workspace: shared-data
 
+    # ── 5. Load test ──────────────────────────────────────────────────────────
     - name: load-test
       taskRef:
-        name: gatling-wiremock-run
+        name: gatling-run
       runAfter:
         - record
       params:
+        - name: app-url
+          value: $(tasks.deploy-app.results.app-url)
         - name: gatling-users
           value: $(params.gatling-users)
         - name: gatling-duration

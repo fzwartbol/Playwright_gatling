@@ -10,25 +10,46 @@ spec:
   taskRunTemplate:
     serviceAccountName: playwright-gatling-sa   # see tekton/rbac.yaml
   params:
-    # ── App repo & overlay ──────────────────────────────────────────────────
+    # ── This repo (load test code + Playwright tests + Gatling simulations) ──
+    - name: loadtest-repo-url
+      value: "https://github.com/myorg/playwright-gatling"   # ← this repo
+    - name: loadtest-repo-revision
+      value: main
+
+    # ── Application under test ────────────────────────────────────────────────
     - name: app-repo-url
       value: "https://github.com/myorg/myapp"   # ← your app repo
     - name: app-repo-revision
       value: main
     - name: overlay-path
-      value: "k8s/overlays/loadtest"             # ← path to your k8s manifests
+      value: "k8s/overlays/loadtest"            # ← path to k8s manifests
     - name: namespace
       value: "loadtest"
     - name: app-service-name
-      value: "myapp-service"                     # ← Service name in the overlay
+      value: "myapp-service"                    # ← Service name in the overlay
     - name: app-service-port
       value: "8080"
 
-    # ── Playwright filter (optional) ────────────────────────────────────────
-    - name: test-filter
-      value: ""                                  # e.g. "GwtJourneyTest" to run one class
+    # ── Downstream service WireMock proxies to during recording ───────────────
+    #
+    # This is the URL your app normally calls (payment API, user service, etc.)
+    # WireMock sits in front of it: app → WireMock → downstream-base-url
+    #
+    # Your app overlay MUST point its outbound calls to WireMock instead:
+    #   env:
+    #     - name: PAYMENT_API_URL
+    #       value: "http://wiremock.loadtest.svc.cluster.local:8080"
+    #
+    # During recording WireMock transparently forwards to downstream-base-url.
+    # During load test WireMock replays the recorded stubs — no live downstream.
+    - name: downstream-base-url
+      value: "https://api.downstream-service.example.com"   # ← real downstream
 
-    # ── Gatling load profile ────────────────────────────────────────────────
+    # ── Playwright filter (optional) ──────────────────────────────────────────
+    - name: test-filter
+      value: ""                              # e.g. "GwtJourneyTest"
+
+    # ── Gatling load profile ──────────────────────────────────────────────────
     - name: gatling-users
       value: "10"
     - name: gatling-duration

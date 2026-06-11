@@ -1,61 +1,54 @@
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
-  name: gatling-wiremock-run
+  name: gatling-run
 spec:
   description: >
-    Starts WireMock in replay mode (stubs from the shared workspace PVC),
-    runs Gatling against it, and archives the HTML report.
-    The real application does not need to be running during this task.
+    Runs a Gatling load test against the real application.
+
+    Traffic flow during load test:
+      Gatling → real app → WireMock (replay stubs) → [no live downstream services needed]
+
+    Gatling measures the throughput and latency of the REAL application.
+    The application's outbound calls to downstream services are served by
+    WireMock stubs recorded in the previous wiremock-record task, so the
+    downstream systems are never hit under load.
+
+    The WireMock Kubernetes Service must still be running (it was deployed by
+    deploy-wiremock and remains up throughout the pipeline).
   params:
+    - name: app-url
+      type: string
+      description: >
+        URL of the real application under load test.
+        E.g. http://myapp.loadtest.svc.cluster.local:8080
+        Gatling sends all load to this URL.
     - name: gatling-users
       type: string
-      default: "5"
+      default: "10"
     - name: gatling-duration
       type: string
-      default: "30"
+      default: "60"
       description: Ramp duration in seconds
     - name: simulation-class
       type: string
       default: "simulations.GwtJourneySimulation"
   workspaces:
     - name: source
+      description: Shared workspace with gatling/ directory
   results:
     - name: report-path
       description: Path to the Gatling HTML report on the workspace
     - name: success-pct
       description: Global successful-request percentage
-  sidecars:
-    - name: wiremock
-      image: wiremock/wiremock:3.5.4-alpine
-      args:
-        - "--port=8080"
-        - "--root-dir=/workspace/source/wiremock"
-        - "--global-response-templating"
-        - "--verbose"
-      readinessProbe:
-        httpGet:
-          path: /__admin/health
-          port: 8080
-        initialDelaySeconds: 3
-        periodSeconds: 2
-        failureThreshold: 20
   steps:
-    - name: wait-for-wiremock
-      image: alpine/curl:8.7.1
-      script: |
-        #!/usr/bin/env sh
-        set -eu
-        until curl -sf http://localhost:8080/__admin/health > /dev/null; do sleep 2; done
-        echo "WireMock ready. Loaded stubs:"
-        curl -s http://localhost:8080/__admin/mappings | grep -o '"total":[0-9]*' || true
-
     - name: run-gatling
       image: maven:3.9.6-eclipse-temurin-11
       workingDir: $(workspaces.source.path)/gatling
       env:
+        # Points Gatling at the REAL application, not WireMock.
         - name: BASE_URL
-          value: "http://localhost:8080"
+          value: "$(params.app-url)"
         - name: GATLING_USERS
           value: "$(params.gatling-users)"
         - name: GATLING_DURATION
@@ -65,6 +58,8 @@ spec:
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
+        echo "Load testing: $BASE_URL"
+        echo "Users: $GATLING_USERS over ${GATLING_DURATION}s"
         mvn -B gatling:test -Dgatling.simulationClass=$(params.simulation-class)
 
     - name: archive-report
@@ -75,7 +70,9 @@ spec:
         set -eu
         REPORT_DIR=$(ls -td target/gatling/*/ 2>/dev/null | head -1)
         [ -z "$REPORT_DIR" ] && echo "No Gatling report found" && exit 1
+
         printf '%s' "$(workspaces.source.path)/gatling/$REPORT_DIR" > $(results.report-path.path)
+
         LOG="$REPORT_DIR/simulation.log"
         if [ -f "$LOG" ]; then
           OK=$(grep -oP 'OK \K[0-9]+(?= \()' "$LOG" | tail -1 || echo 0)
