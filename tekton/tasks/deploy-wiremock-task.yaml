@@ -46,6 +46,15 @@ spec:
     - name: wiremock-url
       description: In-cluster base URL of the WireMock service
   steps:
+    - name: create-namespace
+      image: bitnami/kubectl:1.29
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        kubectl create namespace "$(params.namespace)" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "Namespace $(params.namespace) is ready."
+
     - name: deploy
       image: bitnami/kubectl:1.29
       script: |

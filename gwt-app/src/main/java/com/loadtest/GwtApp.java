@@ -50,6 +50,7 @@ public class GwtApp {
 
     private final HttpClient httpClient = HttpClient.newBuilder()
         .version(HttpClient.Version.HTTP_1_1)
+        .connectTimeout(java.time.Duration.ofSeconds(5))
         .build();
 
     // ── In-memory stores ──────────────────────────────────────────────────
@@ -154,7 +155,7 @@ public class GwtApp {
         }
         String token     = makeToken(user);
         String xsrfToken = UUID.randomUUID().toString().replace("-", "");
-        sessions.put(token, Map.of("username", user, "xsrfToken", xsrfToken));
+        sessions.put(token, new HashMap<>(Map.of("username", user, "xsrfToken", xsrfToken)));
         return ResponseEntity.ok(Map.of("token", token, "xsrfToken", xsrfToken));
     }
 
@@ -219,6 +220,8 @@ public class GwtApp {
 
         String token = auth.substring(7);
         formData.put(token, new HashMap<>(page1Data));
+        // Evict stale entries from prior sessions to avoid unbounded growth
+        if (formData.size() > 10_000) formData.clear();
 
         return ResponseEntity.ok("""
             <!DOCTYPE html>
@@ -300,6 +303,8 @@ public class GwtApp {
         String[] parts = rpcPayload.split("\\|");
         // Params start at index (7 + typeCount) where typeCount = int(parts[2]) - 4
         // For our fixed format they are at indices len-4, len-3, len-2 (address, phone, name)
+        String token2 = auth.substring(7);
+        formData.remove(token2); // evict page1 data — no longer needed
         String confirmationId = "CONF-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
 
         // Call downstream validation service if configured.
@@ -312,6 +317,7 @@ public class GwtApp {
                     .POST(HttpRequest.BodyPublishers.ofString(
                         "{\"submissionId\":\"" + confirmationId + "\"}"))
                     .header("Content-Type", "application/json")
+                    .timeout(java.time.Duration.ofSeconds(5))
                     .build();
                 HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
                 System.out.println("Downstream /api/validate → HTTP " + resp.statusCode() + ": " + resp.body());

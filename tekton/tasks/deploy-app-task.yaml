@@ -39,6 +39,9 @@ spec:
       type: string
       default: "300"
       description: Seconds to wait for Deployments to become ready
+  workspaces:
+    - name: source
+      description: Shared workspace; app repo cloned to $(workspaces.source.path)/app-repo
   results:
     - name: app-url
       description: >
@@ -53,9 +56,9 @@ spec:
         set -eu
         echo "Cloning $(params.app-repo-url) @ $(params.app-repo-revision)"
         git clone --depth=1 --branch "$(params.app-repo-revision)" \
-          "$(params.app-repo-url)" /workspace/app-repo
+          "$(params.app-repo-url)" "$(workspaces.source.path)/app-repo"
         echo "Cloned. Overlay path contents:"
-        ls /workspace/app-repo/$(params.overlay-path)
+        ls "$(workspaces.source.path)/app-repo/$(params.overlay-path)"
 
     - name: create-namespace
       image: bitnami/kubectl:1.29
@@ -110,6 +113,7 @@ spec:
       image: alpine:3.19
       script: |
         #!/usr/bin/env sh
+        set -eu
         APP_URL="http://$(params.app-service-name).$(params.namespace).svc.cluster.local:$(params.app-service-port)"
         echo "App URL: $APP_URL"
         printf '%s' "$APP_URL" > $(results.app-url.path)

@@ -75,8 +75,8 @@ spec:
 
         LOG="$REPORT_DIR/simulation.log"
         if [ -f "$LOG" ]; then
-          OK=$(grep -oP 'OK \K[0-9]+(?= \()' "$LOG" | tail -1 || echo 0)
-          TOT=$(grep -oP 'total \K[0-9]+' "$LOG" | tail -1 || echo 0)
+          OK=$(awk -F'\t' '$1=="REQUEST" && $6=="OK" {ok++} END{print ok+0}' "$LOG")
+          TOT=$(awk -F'\t' '$1=="REQUEST" {tot++} END{print tot+0}' "$LOG")
           PCT=$(( TOT > 0 ? OK * 100 / TOT : 0 ))
           printf '%s' "$PCT" > $(results.success-pct.path)
           echo "Result: $OK/$TOT requests OK ($PCT%)"

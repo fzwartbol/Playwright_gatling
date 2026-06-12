@@ -23,14 +23,14 @@ spec:
         Clone into this subdirectory of the workspace (default: workspace root).
         Use "app" when cloning the app repo alongside the load-test repo.
   workspaces:
-    - name: output
+    - name: source
   steps:
     - name: clone
       image: alpine/git:2.43.0
       script: |
         #!/usr/bin/env sh
         set -eu
-        DEST="$(workspaces.output.path)"
+        DEST="$(workspaces.source.path)"
         if [ -n "$(params.subdirectory)" ]; then
           DEST="$DEST/$(params.subdirectory)"
           mkdir -p "$DEST"
