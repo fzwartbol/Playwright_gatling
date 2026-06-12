@@ -10,13 +10,16 @@ spec:
   taskRunTemplate:
     serviceAccountName: playwright-gatling-sa   # see tekton/rbac.yaml
   params:
-    # ── This repo (load test code + Playwright tests + Gatling simulations) ──
+    # ── This repo (load test code + Playwright tests) ─────────────────────────
     - name: loadtest-repo-url
       value: "https://github.com/myorg/playwright-gatling"   # ← this repo
     - name: loadtest-repo-revision
       value: main
 
     # ── Application under test ────────────────────────────────────────────────
+    # The app runs normally. WireMock sits in front of it during recording
+    # (Playwright → WireMock → app) and replays stubs during load test
+    # (Gatling → WireMock). No special overlay config needed.
     - name: app-repo-url
       value: "https://github.com/myorg/myapp"   # ← your app repo
     - name: app-repo-revision
@@ -30,32 +33,19 @@ spec:
     - name: app-service-port
       value: "8080"
 
-    # ── Downstream service WireMock proxies to during recording ───────────────
-    #
-    # This is the URL your app normally calls (payment API, user service, etc.)
-    # WireMock sits in front of it: app → WireMock → downstream-base-url
-    #
-    # Your app overlay MUST point its outbound calls to WireMock instead:
-    #   env:
-    #     - name: PAYMENT_API_URL
-    #       value: "http://wiremock.loadtest.svc.cluster.local:8080"
-    #
-    # During recording WireMock transparently forwards to downstream-base-url.
-    # During load test WireMock replays the recorded stubs — no live downstream.
-    - name: downstream-base-url
-      value: "https://api.downstream-service.example.com"   # ← real downstream
-
     # ── Playwright filter (optional) ──────────────────────────────────────────
     - name: test-filter
-      value: ""                              # e.g. "GwtJourneyTest"
+      value: ""                                 # e.g. "GwtJourneyTest"
+
+    # ── Generated simulation class name ──────────────────────────────────────
+    - name: simulation-class-name
+      value: "RecordedSimulation"
 
     # ── Gatling load profile ──────────────────────────────────────────────────
     - name: gatling-users
       value: "10"
     - name: gatling-duration
       value: "60"
-    - name: simulation-class
-      value: "simulations.GwtJourneySimulation"
 
   workspaces:
     - name: shared-data

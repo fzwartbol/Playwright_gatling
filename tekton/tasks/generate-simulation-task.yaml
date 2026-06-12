@@ -1,0 +1,51 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: generate-simulation
+spec:
+  description: >
+    Converts a Playwright HAR recording into a Gatling Java DSL simulation.
+
+    Reads the HAR file written by the wiremock-record task and generates a
+    .java simulation class in the gatling/src/test/java/simulations/ directory
+    on the shared workspace. The gatling-run task then compiles and runs it.
+
+    The generated simulation replays the exact requests from the HAR at scale
+    against WireMock. WireMock matches on URL + method and returns the recorded
+    responses — auth headers and tokens are sent as-is and never validated.
+  params:
+    - name: har-name
+      type: string
+      description: >
+        Base name of the HAR file (without .har extension).
+        E.g. gwt-form-journey  →  reads har/gwt-form-journey.har
+    - name: class-name
+      type: string
+      default: RecordedSimulation
+      description: >
+        Java class name for the generated simulation.
+        E.g. RecordedSimulation  →  writes simulations/RecordedSimulation.java
+  workspaces:
+    - name: source
+      description: Shared workspace with har/ and gatling/ directories
+  results:
+    - name: simulation-class
+      description: Fully-qualified class name of the generated simulation
+  steps:
+    - name: generate
+      image: node:20-alpine
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        WS="$(workspaces.source.path)"
+        HAR="$WS/har/$(params.har-name).har"
+        OUT="$WS/gatling/src/test/java/simulations"
+        CLASS="$(params.class-name)"
+
+        [ ! -f "$HAR" ] && echo "HAR not found: $HAR" && exit 1
+
+        echo "Converting $HAR → $CLASS.java"
+        node "$WS/scripts/har-to-simulation.js" "$HAR" "$CLASS" "$OUT"
+
+        printf '%s' "simulations.$CLASS" > $(results.simulation-class.path)
+        echo "simulation-class = simulations.$CLASS"

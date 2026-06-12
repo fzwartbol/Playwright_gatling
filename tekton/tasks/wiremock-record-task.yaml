@@ -4,57 +4,40 @@ metadata:
   name: wiremock-record
 spec:
   description: >
-    Drives Playwright against the real application while WireMock (already
-    running as a Kubernetes Service) proxies and records every outbound call
-    the app makes to downstream services.
+    Drives Playwright through WireMock in recording/proxy mode so that
+    every request and response in the user journey is captured as a stub.
 
     Traffic flow during recording:
-      Playwright → real app → WireMock (proxy mode) → real downstream services
+      Playwright → WireMock (proxy+record) → real application
 
-    After this task, WireMock's mappings/ directory on the shared PVC contains
-    a stub for every downstream request the app made. The gatling-run task then
-    replays those stubs under load without needing the real downstream services.
-
-    Prerequisites
-    ─────────────
-    1. The app must be configured (via its overlay) to route outbound service
-       calls to the WireMock Service URL, e.g.:
-         PAYMENT_API_URL=http://wiremock.<namespace>.svc.cluster.local:8080
-    2. The deploy-wiremock task must have run first.
-    3. downstream-base-url must be the URL of the REAL downstream service that
-       WireMock will proxy to during recording.
-       For multiple downstream services, either:
-         a) Route all of them through a single WireMock instance with path prefixes
-         b) Run this task once per service with different test-filter values
+    After this task completes, WireMock's mappings/ directory contains a stub
+    for every request Playwright made. The generate-simulation task converts the
+    HAR recording into a Gatling simulation, and the gatling-run task replays
+    it at scale against WireMock — no real application needed during the load test.
   params:
     - name: wiremock-url
       type: string
       description: >
         Base URL of the WireMock Kubernetes Service.
         E.g. http://wiremock.loadtest.svc.cluster.local:8080
-        Passed from deploy-wiremock task result.
+        Playwright sends all requests here; WireMock proxies to app-url.
     - name: app-url
       type: string
       description: >
-        URL of the real application that Playwright will drive.
+        URL of the real application that WireMock proxies to during recording.
         E.g. http://myapp.loadtest.svc.cluster.local:8080
-        Passed from deploy-app task result.
-    - name: downstream-base-url
-      type: string
-      description: >
-        URL of the real downstream service WireMock proxies to during recording.
-        E.g. https://api.payments.example.com or http://user-service.prod:8080
-        This is the service the app calls, whose responses you want to stub.
     - name: test-filter
       type: string
       default: ""
       description: Maven Surefire -Dtest filter (empty = all Playwright tests)
   workspaces:
     - name: source
-      description: Shared workspace with load-test repo (playwright/, wiremock/)
+      description: Shared workspace with load-test repo (playwright/, har/, wiremock/)
   results:
     - name: stub-count
-      description: Number of stubs recorded (total including pre-committed)
+      description: Number of stubs recorded
+    - name: har-name
+      description: Base name of the HAR file written to har/ (without .har extension)
   steps:
     - name: start-recording
       image: alpine/curl:8.7.1
@@ -62,39 +45,35 @@ spec:
         #!/usr/bin/env sh
         set -eu
         WM="$(params.wiremock-url)"
+        APP="$(params.app-url)"
 
         echo "Starting WireMock recording"
-        echo "  WireMock admin : $WM"
-        echo "  Proxying to    : $(params.downstream-base-url)"
-        echo ""
+        echo "  WireMock : $WM"
+        echo "  Proxying : $APP"
 
+        # No captureHeaders — stubs match on URL+method only so replay
+        # is not tied to specific token values from the recording session.
         curl -sf -X POST "$WM/__admin/recordings/start" \
           -H 'Content-Type: application/json' \
           -d "{
-            \"targetBaseUrl\": \"$(params.downstream-base-url)\",
+            \"targetBaseUrl\": \"$APP\",
             \"persist\": true,
-            \"repeatsAsScenarios\": false,
-            \"captureHeaders\": {
-              \"Content-Type\":      {\"caseInsensitive\": true},
-              \"Authorization\":     {\"caseInsensitive\": true},
-              \"X-GWT-Module-Base\": {\"caseInsensitive\": true},
-              \"X-GWT-Permutation\": {\"caseInsensitive\": true}
-            }
+            \"repeatsAsScenarios\": false
           }"
-        echo ""
         echo "Recording started."
 
     - name: run-playwright
       image: mcr.microsoft.com/playwright/java:v1.44.0-jammy
       workingDir: $(workspaces.source.path)/playwright
       env:
-        # Playwright drives the REAL application — not WireMock directly.
-        # The app's outbound calls go to WireMock (configured via the overlay).
+        # Playwright drives WireMock (which proxies every request to the real app).
+        # This captures both the requests Playwright makes AND the app's responses.
         - name: BASE_URL
-          value: "$(params.app-url)"
+          value: "$(params.wiremock-url)"
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
+        mkdir -p "$(workspaces.source.path)/har"
         TEST_ARG=""
         [ -n "$(params.test-filter)" ] && TEST_ARG="-Dtest=$(params.test-filter)"
         mvn -B test $TEST_ARG
@@ -108,13 +87,22 @@ spec:
 
         echo "Stopping WireMock recording..."
         curl -sf -X POST "$WM/__admin/recordings/stop"
-        echo ""
 
         TOTAL=$(curl -s "$WM/__admin/mappings" \
           | grep -o '"total":[0-9]*' | grep -o '[0-9]*')
-        echo "Total stubs (including pre-committed): $TOTAL"
-        echo ""
-        echo "Stub files recorded:"
+        echo "Total stubs: $TOTAL"
+        echo "Stub files:"
         ls $(workspaces.source.path)/wiremock/mappings/
-
         printf '%s' "$TOTAL" > $(results.stub-count.path)
+
+    - name: emit-har-name
+      image: alpine:3.19
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        # Find the most recently written HAR file and emit its base name.
+        HAR=$(ls -t $(workspaces.source.path)/har/*.har 2>/dev/null | head -1)
+        [ -z "$HAR" ] && echo "No HAR file found in har/" && exit 1
+        BASE=$(basename "$HAR" .har)
+        echo "HAR recorded: $HAR  (base: $BASE)"
+        printf '%s' "$BASE" > $(results.har-name.path)

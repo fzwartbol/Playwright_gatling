@@ -7,33 +7,22 @@ metadata:
 spec:
   description: >
     End-to-end load test pipeline. Point it at your app repo + overlay and it
-    does everything: clone repos, create namespace, deploy WireMock and the app,
-    record downstream stubs, run load test.
+    does everything automatically:
+      1. Clone this repo onto the PVC
+      2. Deploy WireMock as a K8s Service (proxies to your app during recording)
+      3. Deploy your application
+      4. Run Playwright through WireMock — every request/response is captured
+      5. Auto-generate a Gatling simulation from the HAR recording
+      6. Run Gatling against WireMock at the configured user load
 
-    Architecture
-    ─────────────
-    WireMock sits between the APPLICATION and its DOWNSTREAM DEPENDENCIES.
-    The app overlay must configure outbound service URLs to point to WireMock:
-      http://wiremock.<namespace>.svc.cluster.local:8080
+    Traffic flows:
+      Recording:  Playwright → WireMock (proxy) → real app
+      Load test:  Gatling   → WireMock (replay) → [no real app needed]
 
-    Recording:  Playwright  →  real app  →  WireMock (proxy)  →  real downstream
-    Load test:  Gatling     →  real app  →  WireMock (replay) →  [stubs only]
-
-    Gatling measures real application performance. Downstream services are never
-    hit under load — WireMock replays the stubs recorded during the Playwright run.
-
-    Steps
-    ──────
-    1. fetch-loadtest-repo  Clone the load-test repo (playwright/, gatling/, stubs)
-    2. deploy-wiremock      Deploy WireMock as a K8s Service in the namespace
-    3. deploy-app           Clone the app repo, apply overlay, wait for rollout
-    4. record               Start WireMock recording, run Playwright, stop recording
-    5. load-test            Gatling → real app (app calls WireMock stubs)
   params:
     # ── Load test repo (this repo) ────────────────────────────────────────────
     - name: loadtest-repo-url
       type: string
-      description: Git URL of this load-test repository (playwright + gatling + stubs)
     - name: loadtest-repo-revision
       type: string
       default: main
@@ -41,16 +30,13 @@ spec:
     # ── Application to test ───────────────────────────────────────────────────
     - name: app-repo-url
       type: string
-      description: Git URL of the application repository
+      description: Git URL of your application repository
     - name: app-repo-revision
       type: string
       default: main
     - name: overlay-path
       type: string
-      description: >
-        Path within the app repo to Kubernetes manifests.
-        The overlay MUST configure the app's downstream service URLs to point
-        to http://wiremock.<namespace>.svc.cluster.local:8080
+      description: Path within the app repo to Kubernetes manifests
     - name: namespace
       type: string
       default: loadtest
@@ -61,19 +47,17 @@ spec:
       type: string
       default: "8080"
 
-    # ── WireMock recording ────────────────────────────────────────────────────
-    - name: downstream-base-url
-      type: string
-      description: >
-        URL of the REAL downstream service WireMock proxies to during recording.
-        E.g. https://api.payments.example.com or http://user-svc.prod.svc:8080
-        This is what the app normally calls; WireMock captures all responses.
-
     # ── Playwright ────────────────────────────────────────────────────────────
     - name: test-filter
       type: string
       default: ""
       description: Maven Surefire -Dtest filter (empty = all tests)
+
+    # ── Generated simulation ──────────────────────────────────────────────────
+    - name: simulation-class-name
+      type: string
+      default: RecordedSimulation
+      description: Java class name for the auto-generated Gatling simulation
 
     # ── Gatling ───────────────────────────────────────────────────────────────
     - name: gatling-users
@@ -82,17 +66,11 @@ spec:
     - name: gatling-duration
       type: string
       default: "60"
-    - name: simulation-class
-      type: string
-      default: "simulations.GwtJourneySimulation"
 
   workspaces:
     - name: shared-data
       description: >
         ReadWriteMany PVC shared by all tasks AND the WireMock Deployment pod.
-        The WireMock K8s pod mounts this PVC at /workspace/source so it reads
-        pre-committed stubs and writes newly recorded stubs to the same path
-        that Tekton tasks use.
 
   results:
     - name: wiremock-url
@@ -101,13 +79,15 @@ spec:
       value: $(tasks.deploy-app.results.app-url)
     - name: stub-count
       value: $(tasks.record.results.stub-count)
+    - name: simulation-class
+      value: $(tasks.generate-simulation.results.simulation-class)
     - name: report-path
       value: $(tasks.load-test.results.report-path)
     - name: success-pct
       value: $(tasks.load-test.results.success-pct)
 
   tasks:
-    # ── 1. Clone load-test repo ───────────────────────────────────────────────
+    # ── 1. Clone this load-test repo ─────────────────────────────────────────
     - name: fetch-loadtest-repo
       taskRef:
         name: fetch-repo
@@ -121,8 +101,7 @@ spec:
           workspace: shared-data
 
     # ── 2. Deploy WireMock as K8s Service ────────────────────────────────────
-    # Runs after fetch so pre-committed stubs (wiremock/mappings/) are on the
-    # PVC before the WireMock pod starts.
+    # WireMock reads pre-committed stubs from the PVC immediately on start.
     - name: deploy-wiremock
       taskRef:
         name: deploy-wiremock
@@ -136,7 +115,9 @@ spec:
           workspace: shared-data
 
     # ── 3. Deploy the application under test ─────────────────────────────────
-    # Can run in parallel with deploy-wiremock since they are independent.
+    # Runs in parallel with deploy-wiremock.
+    # The app runs normally — no special overlay config needed because WireMock
+    # sits in FRONT of the app (proxy mode), not between app and its dependencies.
     - name: deploy-app
       taskRef:
         name: deploy-app
@@ -159,7 +140,9 @@ spec:
         - name: source
           workspace: shared-data
 
-    # ── 4. Record stubs ───────────────────────────────────────────────────────
+    # ── 4. Record: Playwright → WireMock → real app ───────────────────────────
+    # Every request and response is captured.
+    # Playwright HAR is also written to har/ on the PVC.
     - name: record
       taskRef:
         name: wiremock-record
@@ -171,29 +154,43 @@ spec:
           value: $(tasks.deploy-wiremock.results.wiremock-url)
         - name: app-url
           value: $(tasks.deploy-app.results.app-url)
-        - name: downstream-base-url
-          value: $(params.downstream-base-url)
         - name: test-filter
           value: $(params.test-filter)
       workspaces:
         - name: source
           workspace: shared-data
 
-    # ── 5. Load test ──────────────────────────────────────────────────────────
+    # ── 5. Auto-generate Gatling simulation from the HAR ─────────────────────
+    - name: generate-simulation
+      taskRef:
+        name: generate-simulation
+      runAfter:
+        - record
+      params:
+        - name: har-name
+          value: $(tasks.record.results.har-name)
+        - name: class-name
+          value: $(params.simulation-class-name)
+      workspaces:
+        - name: source
+          workspace: shared-data
+
+    # ── 6. Load test: Gatling → WireMock (replays stubs) ─────────────────────
+    # Gatling targets WireMock — no real application needed.
     - name: load-test
       taskRef:
         name: gatling-run
       runAfter:
-        - record
+        - generate-simulation
       params:
         - name: app-url
-          value: $(tasks.deploy-app.results.app-url)
+          value: $(tasks.deploy-wiremock.results.wiremock-url)
         - name: gatling-users
           value: $(params.gatling-users)
         - name: gatling-duration
           value: $(params.gatling-duration)
         - name: simulation-class
-          value: $(params.simulation-class)
+          value: $(tasks.generate-simulation.results.simulation-class)
       workspaces:
         - name: source
           workspace: shared-data
