@@ -49,3 +49,19 @@ spec:
 
         printf '%s' "simulations.$CLASS" > $(results.simulation-class.path)
         echo "simulation-class = simulations.$CLASS"
+
+    # Compile the generated simulation immediately so a bad HAR (special
+    # characters, unusual encoding) fails here at step 5 rather than
+    # silently producing a broken load-test run at step 6.
+    - name: compile-check
+      image: maven:3.9.6-eclipse-temurin-11
+      workingDir: $(workspaces.source.path)/gatling
+      env:
+        - name: MAVEN_OPTS
+          value: "-Xmx512m"
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        echo "Compile-checking generated simulation..."
+        mvn -B test-compile -q
+        echo "Compile OK: simulations.$(params.class-name)"

@@ -133,7 +133,11 @@ function esc(s) {
     .replace(/"/g,  '\\"')
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t');
+    .replace(/\t/g, '\\t')
+    // Null bytes and other control characters that would produce uncompilable Java
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, m =>
+      `\\u${m.charCodeAt(0).toString(16).padStart(4, '0')}`
+    );
 }
 
 // Emit a Java string literal that may contain __BASEURL__ (replaced with baseUrl field)
