@@ -6,18 +6,39 @@ metadata:
     app: playwright-gatling
 spec:
   description: >
-    End-to-end load test pipeline. Point it at your app repo + overlay and it
-    does everything automatically:
-      1. Clone this repo onto the PVC
-      2. Deploy WireMock as a K8s Service (proxies to your app during recording)
-      3. Deploy your application
-      4. Run Playwright through WireMock — every request/response is captured
-      5. Auto-generate a Gatling simulation from the HAR recording
-      6. Run Gatling against WireMock at the configured user load
+    Fully-integrated load test pipeline. Point it at your app repo + overlay
+    and it records, generates, and load-tests automatically.
 
-    Traffic flows:
-      Recording:  Playwright → WireMock (proxy) → real app
-      Load test:  Gatling   → WireMock (replay) → [no real app needed]
+    Architecture
+    ────────────
+    WireMock sits between your APPLICATION and its DOWNSTREAM DEPENDENCIES.
+    The app overlay must route downstream calls to WireMock:
+      DOWNSTREAM_SERVICE_URL: http://wiremock.<namespace>.svc.cluster.local:8080
+
+    Recording:   Playwright → real app → WireMock (proxy) → downstream services
+    Load test:   Gatling    → real app → WireMock (replay) → [stubs, no live downstream]
+
+    Gatling measures the REAL APPLICATION'S throughput and latency.
+    Downstream services are stubbed so they are never hit under load.
+
+    Auto-generation
+    ───────────────
+    The Playwright HAR recording is converted into a Gatling simulation by
+    scripts/har-to-simulation.js. The generator:
+      - Detects login requests and parameterises credentials (#{username}/#{password})
+        so every VU logs in with its own identity from feeders/users.csv.
+      - Detects auth tokens in JSON responses (token, xsrfToken, etc.) and adds
+        .check(jsonPath(...).saveAs(...)) so every VU holds its own live token.
+      - Replaces all token values in subsequent requests with #{varName} EL
+        so each VU uses its own freshly-issued token throughout the journey.
+    No manual Gatling code required.
+
+    Pipeline steps
+    ──────────────
+      fetch-loadtest-repo  ──┐
+                             ├──► record ──► generate-simulation ──► load-test
+      deploy-wiremock     ──┤
+      deploy-app          ──┘
 
   params:
     # ── Load test repo (this repo) ────────────────────────────────────────────
@@ -27,7 +48,7 @@ spec:
       type: string
       default: main
 
-    # ── Application to test ───────────────────────────────────────────────────
+    # ── Application under test ────────────────────────────────────────────────
     - name: app-repo-url
       type: string
       description: Git URL of your application repository
@@ -36,28 +57,32 @@ spec:
       default: main
     - name: overlay-path
       type: string
-      description: Path within the app repo to Kubernetes manifests
+      description: >
+        Path to K8s manifests. The overlay MUST set DOWNSTREAM_SERVICE_URL
+        to http://wiremock.<namespace>.svc.cluster.local:8080 so the app's
+        outbound calls are intercepted by WireMock.
     - name: namespace
       type: string
       default: loadtest
     - name: app-service-name
       type: string
-      description: Kubernetes Service name that exposes the application
     - name: app-service-port
       type: string
       default: "8080"
+
+    # ── Downstream service (what WireMock proxies to during recording) ────────
+    - name: downstream-base-url
+      type: string
+      description: >
+        URL of the real downstream service your app calls (payment API, user
+        service, etc.). WireMock proxies to this during recording and replays
+        the stubs during load test — the real downstream is never hit under load.
 
     # ── Playwright ────────────────────────────────────────────────────────────
     - name: test-filter
       type: string
       default: ""
       description: Maven Surefire -Dtest filter (empty = all tests)
-
-    # ── Generated simulation ──────────────────────────────────────────────────
-    - name: simulation-class-name
-      type: string
-      default: RecordedSimulation
-      description: Java class name for the auto-generated Gatling simulation
 
     # ── Gatling ───────────────────────────────────────────────────────────────
     - name: gatling-users
@@ -69,8 +94,7 @@ spec:
 
   workspaces:
     - name: shared-data
-      description: >
-        ReadWriteMany PVC shared by all tasks AND the WireMock Deployment pod.
+      description: ReadWriteMany PVC shared by all tasks and the WireMock pod.
 
   results:
     - name: wiremock-url
@@ -87,7 +111,7 @@ spec:
       value: $(tasks.load-test.results.success-pct)
 
   tasks:
-    # ── 1. Clone this load-test repo ─────────────────────────────────────────
+    # ── 1. Clone this load-test repo onto the PVC ─────────────────────────────
     - name: fetch-loadtest-repo
       taskRef:
         name: fetch-repo
@@ -100,8 +124,8 @@ spec:
         - name: source
           workspace: shared-data
 
-    # ── 2. Deploy WireMock as K8s Service ────────────────────────────────────
-    # WireMock reads pre-committed stubs from the PVC immediately on start.
+    # ── 2. Deploy WireMock as a persistent K8s Service ────────────────────────
+    # Runs after fetch so pre-committed stubs are on the PVC before WireMock starts.
     - name: deploy-wiremock
       taskRef:
         name: deploy-wiremock
@@ -114,10 +138,9 @@ spec:
         - name: source
           workspace: shared-data
 
-    # ── 3. Deploy the application under test ─────────────────────────────────
-    # Runs in parallel with deploy-wiremock.
-    # The app runs normally — no special overlay config needed because WireMock
-    # sits in FRONT of the app (proxy mode), not between app and its dependencies.
+    # ── 3. Clone app repo, apply overlay, wait for rollout ────────────────────
+    # The overlay MUST configure the app to route downstream calls to WireMock:
+    #   DOWNSTREAM_SERVICE_URL: http://wiremock.<namespace>.svc.cluster.local:8080
     - name: deploy-app
       taskRef:
         name: deploy-app
@@ -140,9 +163,9 @@ spec:
         - name: source
           workspace: shared-data
 
-    # ── 4. Record: Playwright → WireMock → real app ───────────────────────────
-    # Every request and response is captured.
-    # Playwright HAR is also written to har/ on the PVC.
+    # ── 4. Record: Playwright → real app → WireMock → downstream ─────────────
+    # WireMock stubs are written to wiremock/mappings/ on the PVC.
+    # Playwright HAR is written to har/ on the PVC.
     - name: record
       taskRef:
         name: wiremock-record
@@ -154,6 +177,8 @@ spec:
           value: $(tasks.deploy-wiremock.results.wiremock-url)
         - name: app-url
           value: $(tasks.deploy-app.results.app-url)
+        - name: downstream-base-url
+          value: $(params.downstream-base-url)
         - name: test-filter
           value: $(params.test-filter)
       workspaces:
@@ -161,6 +186,8 @@ spec:
           workspace: shared-data
 
     # ── 5. Auto-generate Gatling simulation from the HAR ─────────────────────
+    # No manual Gatling code required. The generator handles auth tokens and
+    # per-VU credential parameterisation automatically.
     - name: generate-simulation
       taskRef:
         name: generate-simulation
@@ -170,13 +197,14 @@ spec:
         - name: har-name
           value: $(tasks.record.results.har-name)
         - name: class-name
-          value: $(params.simulation-class-name)
+          value: RecordedSimulation
       workspaces:
         - name: source
           workspace: shared-data
 
-    # ── 6. Load test: Gatling → WireMock (replays stubs) ─────────────────────
-    # Gatling targets WireMock — no real application needed.
+    # ── 6. Load test: Gatling → real app → WireMock stubs ────────────────────
+    # Gatling targets the REAL APPLICATION. The app's downstream calls are
+    # served by WireMock stubs — no live downstream services needed.
     - name: load-test
       taskRef:
         name: gatling-run
@@ -184,7 +212,7 @@ spec:
         - generate-simulation
       params:
         - name: app-url
-          value: $(tasks.deploy-wiremock.results.wiremock-url)
+          value: $(tasks.deploy-app.results.app-url)
         - name: gatling-users
           value: $(params.gatling-users)
         - name: gatling-duration

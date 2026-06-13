@@ -10,36 +10,41 @@ spec:
   taskRunTemplate:
     serviceAccountName: playwright-gatling-sa   # see tekton/rbac.yaml
   params:
-    # ── This repo (load test code + Playwright tests) ─────────────────────────
+    # ── This repo ─────────────────────────────────────────────────────────────
     - name: loadtest-repo-url
       value: "https://github.com/myorg/playwright-gatling"   # ← this repo
     - name: loadtest-repo-revision
       value: main
 
     # ── Application under test ────────────────────────────────────────────────
-    # The app runs normally. WireMock sits in front of it during recording
-    # (Playwright → WireMock → app) and replays stubs during load test
-    # (Gatling → WireMock). No special overlay config needed.
     - name: app-repo-url
       value: "https://github.com/myorg/myapp"   # ← your app repo
     - name: app-repo-revision
       value: main
     - name: overlay-path
-      value: "k8s/overlays/loadtest"            # ← path to k8s manifests
+      value: "k8s/overlays/loadtest"            # ← path to K8s manifests
     - name: namespace
       value: "loadtest"
     - name: app-service-name
-      value: "myapp-service"                    # ← Service name in the overlay
+      value: "myapp-service"                    # ← K8s Service name in the overlay
     - name: app-service-port
       value: "8080"
 
-    # ── Playwright filter (optional) ──────────────────────────────────────────
+    # ── Downstream service ────────────────────────────────────────────────────
+    # The real external/internal service your app calls (payment API, user
+    # service, validation API, etc.).
+    # WireMock proxies here during recording, replays stubs during load test.
+    #
+    # Your app overlay MUST route outbound calls to WireMock instead:
+    #   env:
+    #     - name: DOWNSTREAM_SERVICE_URL
+    #       value: "http://wiremock.loadtest.svc.cluster.local:8080"
+    - name: downstream-base-url
+      value: "https://api.downstream-service.example.com"   # ← real downstream
+
+    # ── Playwright ────────────────────────────────────────────────────────────
     - name: test-filter
       value: ""                                 # e.g. "GwtJourneyTest"
-
-    # ── Generated simulation class name ──────────────────────────────────────
-    - name: simulation-class-name
-      value: "RecordedSimulation"
 
     # ── Gatling load profile ──────────────────────────────────────────────────
     - name: gatling-users
