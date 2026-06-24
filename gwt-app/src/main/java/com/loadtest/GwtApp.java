@@ -39,8 +39,10 @@ public class GwtApp {
     // Static DEMO token issued by the WireMock __auth-login.json stub (priority=1).
     // Pre-registering it lets Playwright drive through WireMock in recording mode
     // without needing the login request to reach the real app.
-    private static final String DEMO_TOKEN = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJsb2FkdGVzdCIsImlhdCI6MH0.DEMO";
-    private static final String DEMO_XSRF  = "static-xsrf-token-for-load-test";
+    private static final String DEMO_TOKEN  = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJsb2FkdGVzdCIsImlhdCI6MH0.DEMO";
+    private static final String DEMO_XSRF   = "static-xsrf-token-for-load-test";
+    // Fixed policy strong name served from /app/mymodule.nocache.js for local E2E testing.
+    private static final String DEMO_POLICY = "AABBCCDDEEFF00112233445566778899";
 
     // Downstream validation service — configured via env var in the loadtest overlay.
     // The overlay sets DOWNSTREAM_SERVICE_URL=http://wiremock.<ns>.svc.cluster.local:8080
@@ -328,6 +330,62 @@ public class GwtApp {
 
         // GWT-RPC success: //OK[<result>,1]
         return ResponseEntity.ok("//OK[\"" + confirmationId + "\",1]");
+    }
+
+    // ── GWT module bootstrap: GET /app/mymodule.nocache.js ───────────────
+    // Serves a fake .nocache.js so GwtXsrfSimulation can auto-discover the
+    // policy strong name via GWT_NOCACHE_JS=http://localhost:8090/app/mymodule.nocache.js
+    @GetMapping(value = "/app/mymodule.nocache.js", produces = "application/javascript")
+    public String noCacheJs() {
+        return "// GWT Demo Module Bootstrap\nvar strongName = '" + DEMO_POLICY + "';\n";
+    }
+
+    // ── GWT-RPC XSRF service: POST /app/xsrf ─────────────────────────────
+    // Mirrors XsrfTokenServiceServlet. Generates a fresh XSRF token per call,
+    // stores it in the VU session, and returns it in GWT-RPC wire format.
+    //
+    // Request:  7|0|4|<moduleBase>|<policy>|XsrfTokenService|getNewXsrfToken|1|2|3|4|0|
+    // Response: //OK[2,1,["com.google.gwt.user.client.rpc.XsrfToken/4254043109","<TOKEN>"],0,7]
+    @PostMapping(value = "/app/xsrf", consumes = "text/x-gwt-rpc", produces = "text/plain")
+    public ResponseEntity<String> getNewXsrfToken(
+            @RequestHeader(value = "Authorization", required = false) String auth) {
+        Map<String, String> session = getSession(auth);
+        if (session == null) return ResponseEntity.status(401).body("//EX[\"Unauthorized\",1]");
+
+        String newToken = UUID.randomUUID().toString().replace("-", "").toUpperCase();
+        session.put("xsrfToken", newToken);
+
+        return ResponseEntity.ok(
+            "//OK[2,1,[\"com.google.gwt.user.client.rpc.XsrfToken/4254043109\",\""
+            + newToken + "\"],0,7]"
+        );
+    }
+
+    // ── Protected GWT-RPC servlet: POST /app/open ─────────────────────────
+    // Simulates a business servlet protected by XSRF. Expects flags=2 in the
+    // GWT-RPC body and validates the embedded token against the VU session.
+    //
+    // Body format (flags=2):
+    //   7|2|N|<base>|<policy>|XsrfToken/<hash>|<tokenValue>|<service>|<method>|...|
+    //   parts[1]="2"  parts[6]=tokenValue  (always at index 6 for flags=2)
+    @PostMapping(value = "/app/open", consumes = "text/x-gwt-rpc", produces = "text/plain")
+    public ResponseEntity<String> gwtRpcOpen(
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @RequestBody String rpcBody) {
+        Map<String, String> session = getSession(auth);
+        if (session == null) return ResponseEntity.status(401).body("//EX[\"Unauthorized\",1]");
+
+        String[] parts = rpcBody.split("\\|");
+        if (parts.length < 7 || !"2".equals(parts[1])) {
+            return ResponseEntity.status(403).body("//EX[\"XSRF token required (flags must be 2)\",1]");
+        }
+        String tokenInBody  = parts[6];
+        String sessionToken = session.get("xsrfToken");
+        if (sessionToken == null || !sessionToken.equals(tokenInBody)) {
+            return ResponseEntity.status(403).body("//EX[\"XSRF token invalid\",1]");
+        }
+
+        return ResponseEntity.ok("//OK[1]");
     }
 
     // ── Confirmation: GET /form/confirmation ──────────────────────────────
