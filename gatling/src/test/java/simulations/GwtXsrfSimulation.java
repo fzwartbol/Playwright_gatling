@@ -57,8 +57,11 @@ public class GwtXsrfSimulation extends Simulation {
     private final String xsrfType = System.getenv().getOrDefault("GWT_XSRF_TYPE_HASH",
         "com.google.gwt.user.client.rpc.XsrfToken/4254043109");
 
-    private final String xsrfUrl  = System.getenv().getOrDefault("GWT_XSRF_URL",  "/app/xsrf");
-    private final String openUrl  = System.getenv().getOrDefault("GWT_OPEN_URL",  "/app/open");
+    private final String xsrfUrl    = System.getenv().getOrDefault("GWT_XSRF_URL",    "/app/xsrf");
+    private final String openUrl    = System.getenv().getOrDefault("GWT_OPEN_URL",    "/app/open");
+    // Fully-qualified GWT service interface name in the RPC stream.
+    // Set GWT_SERVICE_CLASS to your real service, e.g. com.example.app.client.MyRpcService
+    private final String svcClass   = System.getenv().getOrDefault("GWT_SERVICE_CLASS", "com.loadtest.gwt.MyService");
 
     // ── HTTP ──────────────────────────────────────────────────────────────────
 
@@ -156,12 +159,14 @@ public class GwtXsrfSimulation extends Simulation {
                 .header("Authorization", "Bearer #{jwtToken}")
                 .header("X-GWT-Module-Base", moduleBase)
                 .header("X-GWT-Permutation", "#{servletPolicy}")
+                // 6 strings: moduleBase, strongName, xsrfType, xsrfToken, svcClass, method
+                // Data: 1|2|3|4 (xsrf header) | 5|6 (service, method) | 0 (no params)
                 .body(StringBody(session ->
                     "7|2|6|" + moduleBase + "|" +
                     session.getString("servletPolicy") + "|" +
                     xsrfType + "|" +
                     session.getString("xsrfToken") + "|" +
-                    "com.example.MyService|open|" +
+                    svcClass + "|open|" +
                     "1|2|3|4|5|6|0|"
                 ))
                 .check(status().is(200))
@@ -180,17 +185,20 @@ public class GwtXsrfSimulation extends Simulation {
                 .header("Authorization", "Bearer #{jwtToken}")
                 .header("X-GWT-Module-Base", moduleBase)
                 .header("X-GWT-Permutation", "#{servletPolicy}")
-                // N=8: base, policy, xsrfType, xsrfValue, service, method, param1Type, param2Type
+                // ALL 10 strings go in the table first — GWT reads param values by index.
+                // 1=moduleBase 2=strongName 3=xsrfType 4=xsrfToken 5=svcClass 6=method
+                // 7=StringType 8=StringType 9=name 10=email
+                // Data: 1|2|3|4 (xsrf) | 5|6 (service/method) | 2 (param count) | 7|8 (types) | 9|10 (values)
                 .body(StringBody(session ->
-                    "7|2|8|" + moduleBase + "|" +
+                    "7|2|10|" + moduleBase + "|" +
                     session.getString("servletPolicy") + "|" +
                     xsrfType + "|" +
                     session.getString("xsrfToken") + "|" +
-                    "com.example.MyService|submit|" +
+                    svcClass + "|submit|" +
                     "java.lang.String/2004016611|java.lang.String/2004016611|" +
-                    "1|2|3|4|5|6|2|7|8|" +
                     session.getString("name") + "|" +
-                    session.getString("email") + "|"
+                    session.getString("email") + "|" +
+                    "1|2|3|4|5|6|2|7|8|9|10|"
                 ))
                 .check(status().is(200))
                 .check(substring("//OK").exists())

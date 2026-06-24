@@ -22,11 +22,13 @@ public class PermissivePolicy extends SerializationPolicy {
 
     private PermissivePolicy() {}
 
+    // clazz is null when GWT recurses past Object.class (Object.getSuperclass() == null).
+    // Returning false stops the recursion; returning true causes NPE in GWT internals.
     @Override
-    public boolean shouldDeserializeFields(Class<?> clazz) { return true; }
+    public boolean shouldDeserializeFields(Class<?> clazz) { return clazz != null; }
 
     @Override
-    public boolean shouldSerializeFields(Class<?> clazz) { return true; }
+    public boolean shouldSerializeFields(Class<?> clazz) { return clazz != null; }
 
     @Override
     public void validateDeserialize(Class<?> clazz) throws SerializationException {

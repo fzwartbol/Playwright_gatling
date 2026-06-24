@@ -4,22 +4,33 @@ import com.loadtest.gwt.GwtXsrfServlet;
 import com.loadtest.gwt.MyServiceImpl;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.web.servlet.ServletContextInitializer;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import javax.servlet.http.HttpSession;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Map;
 
 /**
  * Spring Boot host for real GWT-RPC servlets.
  *
  * Endpoints:
- *   POST /api/auth/login         — creates HttpSession; returns token for simulation compat
- *   GET  /app/mymodule.nocache.js — bootstrap file; simulation discovers policy from here
- *   POST /app/xsrf               — real XsrfTokenServiceServlet (gwt-servlet.jar)
- *   POST /app/open               — real XsrfProtectedServiceServlet (gwt-servlet.jar)
+ *   POST /api/auth/login          — creates HttpSession (GWT XSRF needs it); returns JWT
+ *   GET  /app/mymodule.nocache.js — bootstrap; simulation discovers policy strong name here
+ *   POST /app/xsrf                — real XsrfTokenServiceServlet (gwt-servlet.jar)
+ *   POST /app/open                — real XsrfProtectedServiceServlet (gwt-servlet.jar)
+ *
+ * Auth model:
+ *   The real enterprise app uses JWT for auth and sessions are not used for
+ *   user identity. However, GWT's XsrfTokenServiceServlet derives the XSRF
+ *   token from the JSESSIONID session. So login here creates both: an HttpSession
+ *   (required by real GWT XSRF internals) and a JWT (what the app actually uses
+ *   for authorization). Gatling carries the JSESSIONID cookie automatically per
+ *   VU, so XSRF validation works without the simulation doing anything special.
  *
  * Run:  mvn spring-boot:run   (port 8090)
  * Test: BASE_URL=http://localhost:8090 GWT_NOCACHE_JS_PATH=/app/mymodule.nocache.js \
@@ -29,10 +40,6 @@ import java.util.Map;
 @RestController
 public class GwtRpcDemoApp {
 
-    // Policy strong name served in the .nocache.js bootstrap.
-    // The simulation's "discover policy" step reads this value.
-    // No GWT compilation needed — this is the only strong name the demo accepts
-    // (doGetSerializationPolicy returns PermissivePolicy for any value).
     private static final String DEMO_POLICY = "AABBCCDDEEFF00112233445566778899";
 
     private static final Map<String, String> USERS = Map.of(
@@ -59,11 +66,15 @@ public class GwtRpcDemoApp {
         return new ServletRegistrationBean<>(new MyServiceImpl(), "/app/open");
     }
 
-    // ── Login: creates HttpSession (required by GWT XSRF) ────────────────────
-    //
-    // XsrfTokenServiceServlet generates the XSRF token from the session ID.
-    // XsrfProtectedServiceServlet re-derives and validates using the same session.
-    // Gatling carries the JSESSIONID cookie automatically per virtual user.
+    // XsrfTokenServiceServlet reads this context-param in its init() to know
+    // which cookie holds the session ID. Without it the servlet throws on first call.
+    @Bean
+    public ServletContextInitializer xsrfContextParam() {
+        return ctx -> ctx.setInitParameter("gwt.xsrf.session_cookie_name", "JSESSIONID");
+    }
+
+    // ── Login ─────────────────────────────────────────────────────────────────
+
     @PostMapping("/api/auth/login")
     public ResponseEntity<?> login(@RequestBody Map<String, String> creds, HttpSession session) {
         String user = creds.getOrDefault("username", "");
@@ -71,18 +82,26 @@ public class GwtRpcDemoApp {
         if (!USERS.containsKey(user) || !USERS.get(user).equals(pass)) {
             return ResponseEntity.status(401).body(Map.of("error", "Invalid credentials"));
         }
+        // Session is required so GWT's XsrfTokenServiceServlet can derive the XSRF
+        // token from the JSESSIONID. The JWT is what the app exposes to clients.
         session.setAttribute("username", user);
-        // Return "token" so the simulation's saveAs("jwtToken") check succeeds.
-        // The GWT servlets use the session cookie, not this token.
-        return ResponseEntity.ok(Map.of("token", "session:" + session.getId().substring(0, 8)));
+        return ResponseEntity.ok(Map.of("token", buildDemoJwt(user)));
+    }
+
+    // Builds a structurally-valid JWT (header.payload.sig in base64url) so
+    // Authorization: Bearer headers look realistic. The signature is not
+    // cryptographically valid — the demo GWT endpoints don't verify it.
+    private static String buildDemoJwt(String username) {
+        Base64.Encoder enc = Base64.getUrlEncoder().withoutPadding();
+        String header  = enc.encodeToString("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".getBytes(StandardCharsets.UTF_8));
+        String payload = enc.encodeToString(
+            ("{\"sub\":\"" + username + "\",\"iat\":1700000000}").getBytes(StandardCharsets.UTF_8));
+        String sig     = enc.encodeToString("DEMO".getBytes(StandardCharsets.UTF_8));
+        return header + "." + payload + "." + sig;
     }
 
     // ── .nocache.js bootstrap ─────────────────────────────────────────────────
-    //
-    // In a real GWT app this file is generated by the GWT compiler.
-    // We serve a minimal version containing just the strong name so the
-    // simulation's "discover policy" step works the same way against the demo
-    // as it does against the real enterprise app.
+
     @GetMapping(value = "/app/mymodule.nocache.js", produces = "application/javascript")
     public String noCacheJs() {
         return "// GWT module bootstrap — policy strong name below\n"
