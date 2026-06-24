@@ -7,6 +7,7 @@ har/
 # Maven build output
 gatling/target/
 gwt-app/target/
+gwt-rpc-demo/target/
 
 # Maven local repo cache
 .m2/
