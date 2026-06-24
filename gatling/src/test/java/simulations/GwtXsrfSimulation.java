@@ -13,47 +13,57 @@ import static io.gatling.javaapi.http.HttpDsl.*;
  * Before every protected GWT-RPC call, a fresh token is fetched from
  * XsrfTokenService — exactly as the browser does.
  *
- * Adjust the CONFIG constants below to match your GWT application:
- *   XSRF_POLICY    — strong name from the .gwt.rpc policy file used by XsrfTokenServiceServlet
- *   SERVLET_POLICY — strong name from the .gwt.rpc policy file used by your protected servlet
- *   XSRF_TYPE      — XsrfToken class hash from your serialisation policy (version-specific)
- *   XSRF_URL       — URL path of the XsrfTokenServiceServlet
- *   OPEN_URL       — URL path of the first protected GWT-RPC servlet
+ * When GWT is recompiled the policy strong names change. Update them without
+ * touching code by setting environment variables before each run:
  *
- * Wire format — XSRF request (flags=0, no token needed to obtain a token):
- *   7|0|4|<moduleBase>|<policy>|com.google.gwt.user.client.rpc.XsrfTokenService|getNewXsrfToken|1|2|3|4|0|
+ *   export GWT_XSRF_POLICY=<new hash>      # 2nd field in XsrfTokenService RPC body
+ *   export GWT_SERVLET_POLICY=<new hash>   # 2nd field in protected servlet RPC body
  *
- * Wire format — protected request (flags=2, XSRF token embedded between policy and service):
- *   7|2|6|<moduleBase>|<policy>|com.google.gwt.user.client.rpc.XsrfToken/<hash>|<token>|<service>|<method>|1|2|3|4|5|6|0|
+ * Find the current values in a fresh HAR recording — they are always the second
+ * pipe-delimited string in any GWT-RPC request body.
  *
- * XSRF response to parse:
+ * Other tunables (all optional — defaults match the demo app):
+ *   BASE_URL           application root          default: http://localhost:8090
+ *   GWT_MODULE_BASE    GWT.getModuleBaseURL()    default: BASE_URL/app/
+ *   GWT_XSRF_URL       XsrfTokenServiceServlet   default: /app/xsrf
+ *   GWT_OPEN_URL       first protected servlet   default: /app/MyServlet
+ *   GWT_XSRF_TYPE_HASH XsrfToken class hash      default: .../4254043109  (GWT runtime version)
+ *   GATLING_USERS      target VU count           default: 5
+ *   GATLING_DURATION   ramp duration (seconds)   default: 20
+ *
+ * Wire format — XSRF request (flags=0):
+ *   7|0|4|<moduleBase>|<xsrfPolicy>|com.google.gwt.user.client.rpc.XsrfTokenService|getNewXsrfToken|1|2|3|4|0|
+ *
+ * Wire format — protected request (flags=2, token embedded after policy):
+ *   7|2|6|<moduleBase>|<servletPolicy>|<xsrfType>|<tokenValue>|<service>|<method>|1|2|3|4|5|6|0|
+ *
+ * XSRF response:
  *   //OK[2,1,["com.google.gwt.user.client.rpc.XsrfToken/4254043109","<TOKEN>"],0,7]
  */
 public class GwtXsrfSimulation extends Simulation {
 
     // ── CONFIG ────────────────────────────────────────────────────────────────
 
-    private final String baseUrl    = System.getenv().getOrDefault("BASE_URL",         "http://localhost:8090");
-    // GWT module base URL — matches the first string in every GWT-RPC request body.
-    // Typically:  <baseUrl>/<contextRoot>/<moduleName>/
-    private final String moduleBase = baseUrl + "/app/";
+    private final String baseUrl      = System.getenv().getOrDefault("BASE_URL",          "http://localhost:8090");
+    private final String moduleBase   = System.getenv().getOrDefault("GWT_MODULE_BASE",   baseUrl + "/app/");
 
     private final int users    = Integer.parseInt(System.getenv().getOrDefault("GATLING_USERS",    "5"));
     private final int duration = Integer.parseInt(System.getenv().getOrDefault("GATLING_DURATION", "20"));
 
-    // Strong names (permutation hashes) — from <module>/<policy>.gwt.rpc filenames in your WAR.
-    // The XsrfTokenService uses the hash from the line in its .gwt.rpc that ends "getNewXsrfToken".
-    private static final String XSRF_POLICY    = "E1EF26ED6384B9AF4934C71870F2E259";
-    private static final String SERVLET_POLICY = "E4239BBA3BAAD57D3250CAACE42D436A";
+    // GWT serialization policy strong names (change on every GWT recompile).
+    // These are the exact values from the real application requests.
+    // Override via GWT_XSRF_POLICY / GWT_SERVLET_POLICY env vars after recompile.
+    private final String xsrfPolicy    = System.getenv().getOrDefault("GWT_XSRF_POLICY",    "E1EF26ED6384B9AF4934C71870F2E259");
+    private final String servletPolicy = System.getenv().getOrDefault("GWT_SERVLET_POLICY", "E4239BBA3BAAD57D3250CAACE42D436A");
 
-    // XsrfToken type hash — from your GWT compile (look for XsrfToken in the .gwt.rpc file).
-    // This value is GWT-version-specific and must match exactly or the server throws
-    // SerializationException: Type '...XsrfToken' was not assignable to IsSerializable.
-    private static final String XSRF_TYPE = "com.google.gwt.user.client.rpc.XsrfToken/4254043109";
+    // XsrfToken class hash — tied to the GWT runtime jar, rarely changes between recompiles.
+    // Update with GWT_XSRF_TYPE_HASH only after a GWT runtime version upgrade.
+    private final String xsrfType = System.getenv().getOrDefault("GWT_XSRF_TYPE_HASH",
+        "com.google.gwt.user.client.rpc.XsrfToken/4254043109");
 
     // Servlet URL paths (relative to baseUrl)
-    private static final String XSRF_URL   = "/app/xsrf";       // XsrfTokenServiceServlet
-    private static final String OPEN_URL   = "/app/MyServlet";  // replace with your servlet path
+    private final String xsrfUrl  = System.getenv().getOrDefault("GWT_XSRF_URL",  "/app/xsrf");
+    private final String openUrl  = System.getenv().getOrDefault("GWT_OPEN_URL",  "/app/MyServlet");
 
     // ── HTTP ──────────────────────────────────────────────────────────────────
 
@@ -65,24 +75,21 @@ public class GwtXsrfSimulation extends Simulation {
 
     // ── XSRF REFRESH CHAIN ────────────────────────────────────────────────────
 
-    // Reusable chain: fetches a fresh XSRF token and saves it as "xsrfToken" in the VU session.
-    // Call this before every protected GWT-RPC exec block.
+    // Reusable chain: call before every protected GWT-RPC exec.
+    // Saves the fresh token as "xsrfToken" in the VU session.
     private final ChainBuilder refreshXsrf = exec(
         http("GWT-RPC XsrfTokenService.getNewXsrfToken")
-            .post(XSRF_URL)
+            .post(xsrfUrl)
             .header("Content-Type", "text/x-gwt-rpc; charset=utf-8")
             .header("X-GWT-Module-Base", moduleBase)
-            .header("X-GWT-Permutation", XSRF_POLICY)
-            // flags=0: no XSRF token needed to call XsrfTokenService itself
+            .header("X-GWT-Permutation", xsrfPolicy)
             .body(StringBody(session ->
                 "7|0|4|" + moduleBase + "|" +
-                XSRF_POLICY + "|" +
+                xsrfPolicy + "|" +
                 "com.google.gwt.user.client.rpc.XsrfTokenService|getNewXsrfToken|" +
                 "1|2|3|4|0|"
             ))
             .check(status().is(200))
-            // Extracts the token value (second string in the array) from:
-            //   //OK[2,1,["com.google.gwt.user.client.rpc.XsrfToken/4254043109","<TOKEN>"],0,7]
             .check(regex("//OK\\[2,1,\\[\"[^\"]+\",\"([^\"]+)\"\\]").saveAs("xsrfToken"))
     );
 
@@ -91,7 +98,7 @@ public class GwtXsrfSimulation extends Simulation {
     private final ScenarioBuilder journey = scenario("GwtXsrfJourney")
         .feed(userFeeder)
 
-        // ── 1. Login — plain JSON, no GWT-RPC ─────────────────────────────
+        // ── 1. Login ───────────────────────────────────────────────────────
         .exec(
             http("POST /api/auth/login")
                 .post("/api/auth/login")
@@ -102,22 +109,19 @@ public class GwtXsrfSimulation extends Simulation {
         )
         .pause(1, 2)
 
-        // ── 2. Get fresh XSRF token → open GWT session ────────────────────
-        // Refresh before the call, use the saved "xsrfToken" inside the body.
-        // Protected request format (flags=2):
-        //   7|2|6|<moduleBase>|<policy>|<xsrfType>|<tokenValue>|<service>|<method>|1|2|3|4|5|6|0|
+        // ── 2. Refresh XSRF → open (flags=2, token embedded in stream) ────
         .exec(refreshXsrf)
         .exec(
             http("GWT-RPC x.class.Servlet.open")
-                .post(OPEN_URL)
+                .post(openUrl)
                 .header("Content-Type", "text/x-gwt-rpc; charset=utf-8")
                 .header("Authorization", "Bearer #{jwtToken}")
                 .header("X-GWT-Module-Base", moduleBase)
-                .header("X-GWT-Permutation", SERVLET_POLICY)
+                .header("X-GWT-Permutation", servletPolicy)
                 .body(StringBody(session ->
                     "7|2|6|" + moduleBase + "|" +
-                    SERVLET_POLICY + "|" +
-                    XSRF_TYPE + "|" +
+                    servletPolicy + "|" +
+                    xsrfType + "|" +
                     session.getString("xsrfToken") + "|" +
                     "x.class.Servlet|open|" +
                     "1|2|3|4|5|6|0|"
@@ -127,23 +131,24 @@ public class GwtXsrfSimulation extends Simulation {
         )
         .pause(1, 2)
 
-        // ── 3. Example: second protected call — refresh XSRF again ─────────
-        // Each exec(refreshXsrf) + exec(protectedCall) pair follows the same pattern.
-        // Duplicate this block for every additional GWT-RPC call in your journey.
+        // ── 3. Refresh XSRF → submit (repeat this pattern for every call) ──
+        // To add more calls: copy this exec(refreshXsrf) + exec(http(...)) block.
+        // The only thing that changes per call is the method name, params, and
+        // string count (N) in the body header.
         .exec(refreshXsrf)
         .exec(
             http("GWT-RPC x.class.Servlet.submit")
-                .post(OPEN_URL)
+                .post(openUrl)
                 .header("Content-Type", "text/x-gwt-rpc; charset=utf-8")
                 .header("Authorization", "Bearer #{jwtToken}")
                 .header("X-GWT-Module-Base", moduleBase)
-                .header("X-GWT-Permutation", SERVLET_POLICY)
-                // 9 strings: base, policy, xsrfType, xsrfValue, service, method, param1Type, param2Type
-                // Adjust N (string count) and stream indices to match your real request.
+                .header("X-GWT-Permutation", servletPolicy)
+                // N=8: base, policy, xsrfType, xsrfValue, service, method, param1Type, param2Type
+                // Adjust N and stream indices to match your actual request body.
                 .body(StringBody(session ->
                     "7|2|8|" + moduleBase + "|" +
-                    SERVLET_POLICY + "|" +
-                    XSRF_TYPE + "|" +
+                    servletPolicy + "|" +
+                    xsrfType + "|" +
                     session.getString("xsrfToken") + "|" +
                     "x.class.Servlet|submit|" +
                     "java.lang.String/2004016611|java.lang.String/2004016611|" +
