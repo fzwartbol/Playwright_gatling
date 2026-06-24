@@ -10,58 +10,81 @@ import static io.gatling.javaapi.http.HttpDsl.*;
 /**
  * GWT enterprise simulation with per-request XSRF token refresh.
  *
- * Before every protected GWT-RPC call, a fresh token is fetched from
- * XsrfTokenService — exactly as the browser does.
+ * Policy strong names are auto-discovered from the GWT .nocache.js bootstrap
+ * file at simulation startup — no manual update needed after a GWT recompile.
  *
- * When GWT is recompiled the policy strong names change. Update them without
- * touching code by setting environment variables before each run:
+ * Required env var (set once per environment):
+ *   GWT_NOCACHE_JS   full URL to the module's .nocache.js, e.g.
+ *                    http://myapp:8080/ctx/mymodule/mymodule.nocache.js
  *
- *   export GWT_XSRF_POLICY=<new hash>      # 2nd field in XsrfTokenService RPC body
- *   export GWT_SERVLET_POLICY=<new hash>   # 2nd field in protected servlet RPC body
+ * Optional overrides (only needed when two modules have different strong names):
+ *   GWT_XSRF_POLICY    override strong name for XsrfTokenServiceServlet
+ *   GWT_SERVLET_POLICY override strong name for the protected servlet
  *
- * Find the current values in a fresh HAR recording — they are always the second
- * pipe-delimited string in any GWT-RPC request body.
- *
- * Other tunables (all optional — defaults match the demo app):
- *   BASE_URL           application root          default: http://localhost:8090
- *   GWT_MODULE_BASE    GWT.getModuleBaseURL()    default: BASE_URL/app/
- *   GWT_XSRF_URL       XsrfTokenServiceServlet   default: /app/xsrf
- *   GWT_OPEN_URL       first protected servlet   default: /app/MyServlet
- *   GWT_XSRF_TYPE_HASH XsrfToken class hash      default: .../4254043109  (GWT runtime version)
- *   GATLING_USERS      target VU count           default: 5
- *   GATLING_DURATION   ramp duration (seconds)   default: 20
- *
- * Wire format — XSRF request (flags=0):
- *   7|0|4|<moduleBase>|<xsrfPolicy>|com.google.gwt.user.client.rpc.XsrfTokenService|getNewXsrfToken|1|2|3|4|0|
- *
- * Wire format — protected request (flags=2, token embedded after policy):
- *   7|2|6|<moduleBase>|<servletPolicy>|<xsrfType>|<tokenValue>|<service>|<method>|1|2|3|4|5|6|0|
- *
- * XSRF response:
- *   //OK[2,1,["com.google.gwt.user.client.rpc.XsrfToken/4254043109","<TOKEN>"],0,7]
+ * Other tunables:
+ *   BASE_URL           application root              default: http://localhost:8090
+ *   GWT_MODULE_BASE    GWT.getModuleBaseURL()        default: BASE_URL/app/
+ *   GWT_XSRF_URL       path to XsrfTokenServiceServlet
+ *   GWT_OPEN_URL       path to the first protected servlet
+ *   GWT_XSRF_TYPE_HASH XsrfToken class hash (tied to GWT jar, rarely changes)
+ *   GATLING_USERS      target VU count              default: 5
+ *   GATLING_DURATION   ramp duration seconds        default: 20
  */
 public class GwtXsrfSimulation extends Simulation {
 
+    // ── AUTO-DISCOVER STRONG NAME ─────────────────────────────────────────────
+
+    /**
+     * Fetches .nocache.js and extracts the first valid GWT permutation strong
+     * name (32 uppercase hex chars). Called once at simulation startup.
+     * Falls back to the provided default if the URL is absent or unreachable.
+     */
+    private static String discoverStrongName(String noCacheJsUrl, String fallback) {
+        if (noCacheJsUrl == null || noCacheJsUrl.isEmpty()) {
+            System.out.println("[GwtXsrfSimulation] GWT_NOCACHE_JS not set — using fallback: " + fallback);
+            return fallback;
+        }
+        try {
+            java.net.URL url = new java.net.URL(noCacheJsUrl);
+            String body = new String(url.openStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            java.util.regex.Matcher m =
+                java.util.regex.Pattern.compile("([0-9A-F]{32})").matcher(body);
+            if (m.find()) {
+                System.out.println("[GwtXsrfSimulation] Discovered strong name from " + noCacheJsUrl + ": " + m.group(1));
+                return m.group(1);
+            }
+            System.err.println("[GwtXsrfSimulation] No strong name found in " + noCacheJsUrl);
+        } catch (Exception e) {
+            System.err.println("[GwtXsrfSimulation] Could not fetch " + noCacheJsUrl + ": " + e.getMessage());
+        }
+        System.out.println("[GwtXsrfSimulation] Falling back to: " + fallback);
+        return fallback;
+    }
+
     // ── CONFIG ────────────────────────────────────────────────────────────────
 
-    private final String baseUrl      = System.getenv().getOrDefault("BASE_URL",          "http://localhost:8090");
-    private final String moduleBase   = System.getenv().getOrDefault("GWT_MODULE_BASE",   baseUrl + "/app/");
+    private final String baseUrl    = System.getenv().getOrDefault("BASE_URL",         "http://localhost:8090");
+    private final String moduleBase = System.getenv().getOrDefault("GWT_MODULE_BASE",  baseUrl + "/app/");
 
     private final int users    = Integer.parseInt(System.getenv().getOrDefault("GATLING_USERS",    "5"));
     private final int duration = Integer.parseInt(System.getenv().getOrDefault("GATLING_DURATION", "20"));
 
-    // GWT serialization policy strong names (change on every GWT recompile).
-    // These are the exact values from the real application requests.
-    // Override via GWT_XSRF_POLICY / GWT_SERVLET_POLICY env vars after recompile.
-    private final String xsrfPolicy    = System.getenv().getOrDefault("GWT_XSRF_POLICY",    "E1EF26ED6384B9AF4934C71870F2E259");
-    private final String servletPolicy = System.getenv().getOrDefault("GWT_SERVLET_POLICY", "E4239BBA3BAAD57D3250CAACE42D436A");
+    // Discover once from the deployed .nocache.js; both policies default to the
+    // same value because all servlets of a single GWT module share one strong name.
+    // Set GWT_XSRF_POLICY / GWT_SERVLET_POLICY individually only if your app
+    // spreads services across two different GWT modules.
+    private final String discoveredPolicy = discoverStrongName(
+        System.getenv("GWT_NOCACHE_JS"),
+        "E1EF26ED6384B9AF4934C71870F2E259"   // last-known value; used when app is unreachable
+    );
+    private final String xsrfPolicy    = System.getenv().getOrDefault("GWT_XSRF_POLICY",    discoveredPolicy);
+    private final String servletPolicy = System.getenv().getOrDefault("GWT_SERVLET_POLICY", discoveredPolicy);
 
-    // XsrfToken class hash — tied to the GWT runtime jar, rarely changes between recompiles.
-    // Update with GWT_XSRF_TYPE_HASH only after a GWT runtime version upgrade.
+    // XsrfToken class hash — tied to the GWT runtime jar, stable between recompiles.
+    // Update GWT_XSRF_TYPE_HASH only after a GWT version upgrade.
     private final String xsrfType = System.getenv().getOrDefault("GWT_XSRF_TYPE_HASH",
         "com.google.gwt.user.client.rpc.XsrfToken/4254043109");
 
-    // Servlet URL paths (relative to baseUrl)
     private final String xsrfUrl  = System.getenv().getOrDefault("GWT_XSRF_URL",  "/app/xsrf");
     private final String openUrl  = System.getenv().getOrDefault("GWT_OPEN_URL",  "/app/MyServlet");
 
@@ -75,8 +98,13 @@ public class GwtXsrfSimulation extends Simulation {
 
     // ── XSRF REFRESH CHAIN ────────────────────────────────────────────────────
 
-    // Reusable chain: call before every protected GWT-RPC exec.
-    // Saves the fresh token as "xsrfToken" in the VU session.
+    // Call exec(refreshXsrf) immediately before every protected GWT-RPC exec.
+    // Saves the current token as "xsrfToken" in the VU session.
+    //
+    // Request (flags=0 — no token needed to obtain a token):
+    //   7|0|4|<moduleBase>|<policy>|com.google.gwt.user.client.rpc.XsrfTokenService|getNewXsrfToken|1|2|3|4|0|
+    // Response:
+    //   //OK[2,1,["com.google.gwt.user.client.rpc.XsrfToken/4254043109","<TOKEN>"],0,7]
     private final ChainBuilder refreshXsrf = exec(
         http("GWT-RPC XsrfTokenService.getNewXsrfToken")
             .post(xsrfUrl)
@@ -109,7 +137,7 @@ public class GwtXsrfSimulation extends Simulation {
         )
         .pause(1, 2)
 
-        // ── 2. Refresh XSRF → open (flags=2, token embedded in stream) ────
+        // ── 2. Refresh XSRF → open (flags=2, token after policy in stream) ─
         .exec(refreshXsrf)
         .exec(
             http("GWT-RPC x.class.Servlet.open")
@@ -131,10 +159,10 @@ public class GwtXsrfSimulation extends Simulation {
         )
         .pause(1, 2)
 
-        // ── 3. Refresh XSRF → submit (repeat this pattern for every call) ──
-        // To add more calls: copy this exec(refreshXsrf) + exec(http(...)) block.
-        // The only thing that changes per call is the method name, params, and
-        // string count (N) in the body header.
+        // ── 3. Refresh XSRF → submit ───────────────────────────────────────
+        // Pattern for every additional protected call:
+        //   .exec(refreshXsrf)
+        //   .exec(http("...").post(...).body(StringBody(session -> "7|2|N|" + ...)))
         .exec(refreshXsrf)
         .exec(
             http("GWT-RPC x.class.Servlet.submit")
