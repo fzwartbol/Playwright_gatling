@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://xmlns.jcp.org/xml/ns/javaee
+             http://xmlns.jcp.org/xml/ns/javaee/web-app_4_0.xsd"
+         version="4.0">
+
+    <!--
+        Required by XsrfTokenServiceServlet.init(): it reads this parameter to know
+        which cookie carries the session ID so it can derive the XSRF token.
+    -->
+    <context-param>
+        <param-name>gwt.xsrf.session_cookie_name</param-name>
+        <param-value>JSESSIONID</param-value>
+    </context-param>
+
+    <!--
+        Creates an HttpSession before GWT servlets run.
+        Liberty's OIDC inboundPropagation is stateless — it does NOT create a session.
+        XsrfTokenServiceServlet.getNewXsrfToken() calls getSession(false) and throws
+        "Session cookie is not set or empty" if no session exists.
+        This filter bridges stateless OIDC auth with session-based GWT XSRF.
+    -->
+    <filter>
+        <filter-name>sessionInitFilter</filter-name>
+        <filter-class>com.loadtest.SessionInitFilter</filter-class>
+    </filter>
+    <filter-mapping>
+        <filter-name>sessionInitFilter</filter-name>
+        <url-pattern>/app/*</url-pattern>
+    </filter-mapping>
+
+    <!-- GWT XSRF token endpoint — real XsrfTokenServiceServlet from gwt-servlet.jar -->
+    <servlet>
+        <servlet-name>xsrfServlet</servlet-name>
+        <servlet-class>com.loadtest.gwt.GwtXsrfServlet</servlet-class>
+    </servlet>
+    <servlet-mapping>
+        <servlet-name>xsrfServlet</servlet-name>
+        <url-pattern>/app/xsrf</url-pattern>
+    </servlet-mapping>
+
+    <!-- GWT protected service — real XsrfProtectedServiceServlet from gwt-servlet.jar -->
+    <servlet>
+        <servlet-name>myServiceServlet</servlet-name>
+        <servlet-class>com.loadtest.gwt.MyServiceImpl</servlet-class>
+    </servlet>
+    <servlet-mapping>
+        <servlet-name>myServiceServlet</servlet-name>
+        <url-pattern>/app/open</url-pattern>
+    </servlet-mapping>
+
+    <!--
+        Security constraint that maps Liberty's OIDC-authenticated users to the
+        "users" role declared in server.xml application-bnd.
+        The OIDC authFilter already intercepts only /app/xsrf and /app/open;
+        this constraint reinforces the same paths at the EE security layer.
+    -->
+    <security-constraint>
+        <web-resource-collection>
+            <web-resource-name>GWT RPC endpoints</web-resource-name>
+            <url-pattern>/app/xsrf</url-pattern>
+            <url-pattern>/app/open</url-pattern>
+        </web-resource-collection>
+        <auth-constraint>
+            <role-name>users</role-name>
+        </auth-constraint>
+    </security-constraint>
+
+    <security-role>
+        <role-name>users</role-name>
+    </security-role>
+
+</web-app>

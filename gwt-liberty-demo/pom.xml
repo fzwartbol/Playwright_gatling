@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.loadtest</groupId>
+  <artifactId>gwt-liberty-demo</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <packaging>war</packaging>
+
+  <description>
+    GWT-RPC demo on Open Liberty with openidConnectClient-1.0.
+    Uses servlet-4.0 (EE 8 / javax.servlet) for gwt-servlet compatibility.
+    Embeds a self-contained OIDC token issuer (/auth/token + /auth/jwks)
+    signed with a runtime-generated RSA key pair so no external IDP is needed
+    for local load testing.
+
+    Start: mvn liberty:run   (port 8090)
+    Production: set OIDC_TOKEN_URL to your Keycloak/ISAM token endpoint.
+  </description>
+
+  <properties>
+    <java.version>17</java.version>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <liberty.version>24.0.0.9</liberty.version>
+    <gwt.version>2.10.0</gwt.version>
+  </properties>
+
+  <dependencies>
+    <!-- Servlet API — provided by Liberty (servlet-4.0 feature = javax.servlet 4.0) -->
+    <dependency>
+      <groupId>javax.servlet</groupId>
+      <artifactId>javax.servlet-api</artifactId>
+      <version>4.0.1</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Real GWT server-side RPC (javax.servlet namespace, compatible with servlet-4.0) -->
+    <dependency>
+      <groupId>com.google.gwt</groupId>
+      <artifactId>gwt-servlet</artifactId>
+      <version>${gwt.version}</version>
+    </dependency>
+
+    <!-- JWT signing for embedded OIDC token endpoint (bundled in WEB-INF/lib) -->
+    <dependency>
+      <groupId>com.nimbusds</groupId>
+      <artifactId>nimbus-jose-jwt</artifactId>
+      <version>9.37.3</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>gwt-liberty-demo</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-war-plugin</artifactId>
+        <version>3.4.0</version>
+        <configuration>
+          <failOnMissingWebXml>false</failOnMissingWebXml>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>io.openliberty.tools</groupId>
+        <artifactId>liberty-maven-plugin</artifactId>
+        <version>3.10.3</version>
+        <configuration>
+          <assemblyArtifact>
+            <groupId>io.openliberty</groupId>
+            <artifactId>openliberty-runtime</artifactId>
+            <version>${liberty.version}</version>
+            <type>zip</type>
+          </assemblyArtifact>
+          <configFile>src/main/liberty/config/server.xml</configFile>
+          <!-- Deploy the WAR to Liberty's apps/ directory -->
+          <appFileName>gwt-liberty-demo.war</appFileName>
+        </configuration>
+        <executions>
+          <execution>
+            <id>install-liberty</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>create</goal>
+              <goal>install-feature</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>deploy</id>
+            <phase>package</phase>
+            <goals>
+              <goal>deploy</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

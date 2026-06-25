@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<server description="GWT XSRF load-test demo — Open Liberty with OIDC client">
+
+    <featureManager>
+        <!-- EE 8 servlet (javax.servlet namespace) — compatible with gwt-servlet 2.10 -->
+        <feature>servlet-4.0</feature>
+        <!-- Application security (JAAS subject, role mapping) -->
+        <feature>appSecurity-3.0</feature>
+        <!-- OIDC relying-party client: validates Bearer tokens from the IDP -->
+        <feature>openidConnectClient-1.0</feature>
+    </featureManager>
+
+    <!-- Plain HTTP on 8090 — TLS is handled at the load balancer in production -->
+    <httpEndpoint id="defaultHttpEndpoint"
+                  host="*"
+                  httpPort="8090"
+                  httpsPort="-1"/>
+
+    <!--
+        OIDC client configuration — inbound Bearer token propagation only.
+
+        For local demo: the WAR's embedded /auth/token and /auth/jwks act as the IDP.
+        For production: override via system properties or Liberty variable substitution:
+            -DjwkEndpointUrl=https://keycloak.company.com/realms/app/protocol/openid-connect/certs
+            -DissuerIdentifier=https://keycloak.company.com/realms/app
+
+        inboundPropagation="required": Liberty validates Bearer tokens and establishes
+        a JAAS subject; redirect/login-page flow is never triggered.
+        httpsRequired="false": allows plain HTTP on localhost (remove for production).
+    -->
+    <openidConnectClient id="oidcClient"
+        clientId="gwt-demo"
+        clientSecret="demo-secret-not-used-for-inbound"
+        jwkEndpointUrl="http://localhost:8090/auth/jwks"
+        issuerIdentifier="http://localhost:8090/auth"
+        inboundPropagation="required"
+        httpsRequired="false"
+        signatureAlgorithm="RS256"
+        audiences="gwt-demo"
+        authFilterRef="gwtFilter"/>
+
+    <!--
+        Only protect the GWT RPC endpoints.
+        /auth/* and /app/mymodule.nocache.js are left public so token issuance
+        and policy discovery work without credentials.
+    -->
+    <authFilter id="gwtFilter">
+        <requestUrl id="xsrfUrl" urlPattern="/app/xsrf" matchType="equals"/>
+        <requestUrl id="openUrl"  urlPattern="/app/open" matchType="equals"/>
+    </authFilter>
+
+    <webApplication id="gwt-liberty-demo"
+                    location="gwt-liberty-demo.war"
+                    contextRoot="/"
+                    autoStart="true">
+        <application-bnd>
+            <security-role name="users">
+                <special-subject type="ALL_AUTHENTICATED_USERS"/>
+            </security-role>
+        </application-bnd>
+    </webApplication>
+
+</server>

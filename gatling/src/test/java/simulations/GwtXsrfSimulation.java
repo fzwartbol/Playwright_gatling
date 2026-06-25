@@ -15,28 +15,41 @@ import static io.gatling.javaapi.http.HttpDsl.*;
  * startup code, no env var needed, and redeployments during a test are
  * automatically picked up by new VUs.
  *
- * Set GWT_NOCACHE_JS_PATH to the path of your module's .nocache.js:
- *   export GWT_NOCACHE_JS_PATH=/ctx/mymodule/mymodule.nocache.js
+ * Authentication uses OIDC Resource Owner Password Credentials (ROPC) grant:
+ *   POST OIDC_TOKEN_URL  ← same call a real OAuth2 client makes
+ *   Body: grant_type=password&username=...&password=...&client_id=...
+ *   Extract: access_token → used as Authorization: Bearer on every RPC call
  *
- * If not set, falls back to GWT_POLICY env var or the hardcoded default.
+ * For local demo (gwt-liberty-demo): OIDC_TOKEN_URL defaults to the embedded
+ * /auth/token servlet, which issues real RS256-signed JWTs.
+ * For production: set OIDC_TOKEN_URL to your Keycloak/ISAM token endpoint.
  *
- * Other env vars:
- *   BASE_URL           app root                    http://localhost:8090
- *   GWT_MODULE_BASE    GWT.getModuleBaseURL()      BASE_URL/app/
- *   GWT_POLICY         fallback policy hash        (last-known value)
- *   GWT_XSRF_POLICY    override xsrf service hash  (if different module)
- *   GWT_SERVLET_POLICY override servlet hash       (if different module)
- *   GWT_XSRF_URL       XsrfTokenServiceServlet     /app/xsrf
- *   GWT_OPEN_URL       protected servlet           /app/open
- *   GWT_XSRF_TYPE_HASH XsrfToken class hash        (tied to gwt jar)
+ * Env vars:
+ *   BASE_URL            app root                       http://localhost:8090
+ *   OIDC_TOKEN_URL      ROPC token endpoint            BASE_URL/auth/token
+ *   OIDC_CLIENT_ID      OAuth2 client_id               gwt-demo
+ *   OIDC_CLIENT_SECRET  OAuth2 client_secret           (empty for public clients)
+ *   GWT_MODULE_BASE     GWT.getModuleBaseURL()         BASE_URL/app/
+ *   GWT_NOCACHE_JS_PATH path to .nocache.js bootstrap  /app/mymodule.nocache.js
+ *   GWT_POLICY          fallback policy hash           (last-known value)
+ *   GWT_XSRF_POLICY     override xsrf service hash     (if different module)
+ *   GWT_SERVLET_POLICY  override servlet hash          (if different module)
+ *   GWT_SERVICE_CLASS   fully-qualified GWT service    com.loadtest.gwt.MyService
+ *   GWT_XSRF_URL        XsrfTokenServiceServlet path   /app/xsrf
+ *   GWT_OPEN_URL        protected servlet path         /app/open
+ *   GWT_XSRF_TYPE_HASH  XsrfToken class hash           (tied to gwt jar)
  *   GATLING_USERS / GATLING_DURATION
  */
 public class GwtXsrfSimulation extends Simulation {
 
     // ── CONFIG ────────────────────────────────────────────────────────────────
 
-    private final String baseUrl    = System.getenv().getOrDefault("BASE_URL",         "http://localhost:8090");
-    private final String moduleBase = System.getenv().getOrDefault("GWT_MODULE_BASE",  baseUrl + "/app/");
+    private final String baseUrl        = System.getenv().getOrDefault("BASE_URL",           "http://localhost:8090");
+    private final String moduleBase     = System.getenv().getOrDefault("GWT_MODULE_BASE",    baseUrl + "/app/");
+    // OIDC ROPC — defaults point at the embedded token issuer in gwt-liberty-demo
+    private final String oidcTokenUrl   = System.getenv().getOrDefault("OIDC_TOKEN_URL",     baseUrl + "/auth/token");
+    private final String oidcClientId   = System.getenv().getOrDefault("OIDC_CLIENT_ID",     "gwt-demo");
+    private final String oidcClientSec  = System.getenv().getOrDefault("OIDC_CLIENT_SECRET", "");
 
     private final int users    = Integer.parseInt(System.getenv().getOrDefault("GATLING_USERS",    "5"));
     private final int duration = Integer.parseInt(System.getenv().getOrDefault("GATLING_DURATION", "20"));
@@ -138,14 +151,23 @@ public class GwtXsrfSimulation extends Simulation {
 
         .feed(userFeeder)
 
-        // 1. Login
+        // 1. OIDC ROPC — same call a real OAuth2 client makes against Keycloak / ISAM / Azure AD.
+        //    The token URL, client_id and client_secret are set via env vars so the same
+        //    simulation works unchanged against both the local demo and production IDP.
         .exec(
-            http("POST /api/auth/login")
-                .post("/api/auth/login")
-                .header("Content-Type", "application/json")
-                .body(StringBody("{\"username\":\"#{username}\",\"password\":\"#{password}\"}"))
+            http("POST OIDC token (ROPC)")
+                .post(oidcTokenUrl)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(StringBody(session ->
+                    "grant_type=password" +
+                    "&username=" + session.getString("username") +
+                    "&password=" + session.getString("password") +
+                    "&client_id=" + oidcClientId +
+                    (oidcClientSec.isEmpty() ? "" : "&client_secret=" + oidcClientSec) +
+                    "&scope=openid"
+                ))
                 .check(status().is(200))
-                .check(jsonPath("$.token").saveAs("jwtToken"))
+                .check(jsonPath("$.access_token").saveAs("jwtToken"))
         )
         .pause(1, 2)
 
