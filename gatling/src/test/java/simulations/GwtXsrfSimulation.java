@@ -31,9 +31,10 @@ import static io.gatling.javaapi.http.HttpDsl.*;
  *   OIDC_CLIENT_SECRET  OAuth2 client_secret           (empty for public clients)
  *   GWT_MODULE_BASE     GWT.getModuleBaseURL()         BASE_URL/app/
  *   GWT_NOCACHE_JS_PATH path to .nocache.js bootstrap  /app/mymodule.nocache.js
- *   GWT_POLICY          fallback policy hash           (last-known value)
- *   GWT_XSRF_POLICY     override xsrf service hash     (if different module)
- *   GWT_SERVLET_POLICY  override servlet hash          (if different module)
+ *   GWT_PERMUTATION     fallback permutation name      (X-GWT-Permutation header)
+ *   GWT_XSRF_POLICY     XsrfTokenService RPC policy     ← field #2 of xsrf stream
+ *   GWT_SERVLET_POLICY  business service RPC policy     ← field #2 of service stream
+ *                       (per-service; capture from recorded RPC traffic, NOT .nocache.js)
  *   GWT_SERVICE_CLASS   fully-qualified GWT service    com.loadtest.gwt.MyService
  *   GWT_XSRF_URL        XsrfTokenServiceServlet path   /app/xsrf
  *   GWT_OPEN_URL        protected servlet path         /app/open
@@ -54,17 +55,35 @@ public class GwtXsrfSimulation extends Simulation {
     private final int users    = Integer.parseInt(System.getenv().getOrDefault("GATLING_USERS",    "5"));
     private final int duration = Integer.parseInt(System.getenv().getOrDefault("GATLING_DURATION", "20"));
 
-    // Path to .nocache.js — fetched as the first HTTP call per VU.
-    // Leave blank to skip discovery and use the fallback policy below.
+    // ── TWO DIFFERENT GWT "strong names" — do not confuse them ──────────────────
+    //
+    // (A) PERMUTATION strong name — picks which compiled JS bundle. Lives in
+    //     .nocache.js and is echoed back in the X-GWT-Permutation header. It is
+    //     informational for the server's policy lookup; auto-discovery is fine here.
+    //
+    // (B) RPC SERIALIZATION-POLICY strong name — field #2 of the RPC stream
+    //     (7|flags|N|<moduleBase>|<THIS>|...). The server loads
+    //     <moduleBase><THIS>.gwt.rpc to know which types it may deserialize.
+    //     This is PER-SERVICE (XsrfTokenService and your business service have
+    //     DIFFERENT values) and is NOT the .nocache.js permutation strong name.
+    //     If the wrong value is sent, the .gwt.rpc file is not found, GWT falls
+    //     back to the strict LegacySerializationPolicy, and the embedded XsrfToken
+    //     is rejected with IncompatibleRemoteServiceException
+    //     ("...was not assignable to IsSerializable...will not be deserialized").
+    //
+    // (B) MUST come from recorded RPC traffic (or the deployed *.gwt.rpc filenames),
+    // never from .nocache.js. Set these per-service env vars to your real values.
+
+    // (A) Permutation strong name — for the X-GWT-Permutation header only.
+    // Path to .nocache.js — fetched as the first HTTP call per VU. Leave blank to skip.
     private final String noCacheJsPath = System.getenv().getOrDefault("GWT_NOCACHE_JS_PATH", "/app/mymodule.nocache.js");
+    // Fallback permutation name when .nocache.js is unavailable.
+    private final String permFallback  = System.getenv().getOrDefault("GWT_PERMUTATION", "E1EF26ED6384B9AF4934C71870F2E259");
 
-    // Fallback when .nocache.js is not available or GWT_NOCACHE_JS_PATH is not set.
-    // Update after a GWT recompile if you are not using auto-discovery.
-    private final String fallbackPolicy = System.getenv().getOrDefault("GWT_POLICY", "E1EF26ED6384B9AF4934C71870F2E259");
-
-    // Optional per-module overrides (most apps use one module → same policy for all servlets).
-    private final String xsrfPolicyOverride    = System.getenv("GWT_XSRF_POLICY");
-    private final String servletPolicyOverride = System.getenv("GWT_SERVLET_POLICY");
+    // (B) RPC serialization-policy strong names — field #2 of the RPC stream, PER-SERVICE.
+    // Capture from recorded GWT-RPC requests. These are NOT auto-discoverable.
+    private final String xsrfRpcPolicy    = System.getenv().getOrDefault("GWT_XSRF_POLICY",    "E1EF26ED6384B9AF4934C71870F2E259");
+    private final String servletRpcPolicy = System.getenv().getOrDefault("GWT_SERVLET_POLICY", "E4239BBA3BAAD57D3250CAACE42D436A");
 
     // XsrfToken class hash — stable across recompiles, changes only on GWT jar upgrade.
     private final String xsrfType = System.getenv().getOrDefault("GWT_XSRF_TYPE_HASH",
@@ -84,41 +103,25 @@ public class GwtXsrfSimulation extends Simulation {
 
     private final FeederBuilder<String> userFeeder = csv("feeders/users.csv").random();
 
-    // ── STEP 0: Discover policy from .nocache.js (first call per VU) ─────────
+    // ── STEP 0: Discover the PERMUTATION strong name from .nocache.js ──────────
     //
-    // The GWT module's bootstrap file always contains the current permutation
-    // strong name as a 32-char uppercase hex string. We extract it with a regex
-    // and store it in the VU session as "gwtPolicy".
+    // The module's bootstrap file contains the permutation strong name as a
+    // 32-char uppercase hex string. We extract it and store it as "permStrongName"
+    // for use in the X-GWT-Permutation header (concept (A) above).
     //
-    // Running this inside the scenario (not at startup) means:
-    //  - Each VU discovers the policy independently
-    //  - If the app is redeployed mid-test, new VUs pick up the new strong name
-    //  - No Java HttpClient / startup overhead
-    //
-    // Falls back to GWT_POLICY env var (or hardcoded default) when the path
-    // is not configured or returns no match.
+    // NOTE: this is the permutation name, NOT the RPC serialization-policy strong
+    // name. The policy hashes that go into the RPC stream are the per-service
+    // constants xsrfRpcPolicy / servletRpcPolicy and are never discovered here.
     private final ChainBuilder discoverPolicy = exec(session ->
-        // Pre-seed with fallback so GWT_POLICY is always in session
-        session.set("gwtPolicy", fallbackPolicy)
-               .set("xsrfPolicy",    xsrfPolicyOverride    != null ? xsrfPolicyOverride    : fallbackPolicy)
-               .set("servletPolicy", servletPolicyOverride != null ? servletPolicyOverride : fallbackPolicy)
+        session.set("permStrongName", permFallback)
     )
     .doIf(session -> !noCacheJsPath.isBlank())
         .then(exec(
             http("GET .nocache.js")
                 .get(noCacheJsPath)
                 .check(status().in(200, 304))
-                // Extract first 32-char hex strong name from the bootstrap file.
-                // The name appears as the permutation map key or a loadScript() argument.
-                .check(regex("([0-9A-F]{32})").optional().saveAs("gwtPolicy"))
-        )
-        .exec(session -> {
-            String discovered = session.getString("gwtPolicy");
-            // Only override the per-module values if no explicit env var was set
-            String xp = xsrfPolicyOverride    != null ? xsrfPolicyOverride    : discovered;
-            String sp = servletPolicyOverride != null ? servletPolicyOverride : discovered;
-            return session.set("xsrfPolicy", xp).set("servletPolicy", sp);
-        }));
+                .check(regex("([0-9A-F]{32})").optional().saveAs("permStrongName"))
+        ));
 
     // ── XSRF REFRESH CHAIN ────────────────────────────────────────────────────
 
@@ -131,10 +134,11 @@ public class GwtXsrfSimulation extends Simulation {
             .header("Content-Type", "text/x-gwt-rpc; charset=utf-8")
             .header("Authorization", "Bearer #{jwtToken}")
             .header("X-GWT-Module-Base", moduleBase)
-            .header("X-GWT-Permutation", "#{xsrfPolicy}")
+            .header("X-GWT-Permutation", "#{permStrongName}")
+            // field #2 = XsrfTokenService's own RPC policy strong name (xsrfRpcPolicy)
             .body(StringBody(session ->
                 "7|0|4|" + moduleBase + "|" +
-                session.getString("xsrfPolicy") + "|" +
+                xsrfRpcPolicy + "|" +
                 "com.google.gwt.user.client.rpc.XsrfTokenService|getNewXsrfToken|" +
                 "1|2|3|4|0|"
             ))
@@ -180,12 +184,13 @@ public class GwtXsrfSimulation extends Simulation {
                 .header("Content-Type", "text/x-gwt-rpc; charset=utf-8")
                 .header("Authorization", "Bearer #{jwtToken}")
                 .header("X-GWT-Module-Base", moduleBase)
-                .header("X-GWT-Permutation", "#{servletPolicy}")
-                // 6 strings: moduleBase, strongName, xsrfType, xsrfToken, svcClass, method
+                .header("X-GWT-Permutation", "#{permStrongName}")
+                // field #2 = business service's own RPC policy strong name (servletRpcPolicy)
+                // 6 strings: moduleBase, policy, xsrfType, xsrfToken, svcClass, method
                 // Data: 1|2|3|4 (xsrf header) | 5|6 (service, method) | 0 (no params)
                 .body(StringBody(session ->
                     "7|2|6|" + moduleBase + "|" +
-                    session.getString("servletPolicy") + "|" +
+                    servletRpcPolicy + "|" +
                     xsrfType + "|" +
                     session.getString("xsrfToken") + "|" +
                     svcClass + "|open|" +
@@ -206,14 +211,15 @@ public class GwtXsrfSimulation extends Simulation {
                 .header("Content-Type", "text/x-gwt-rpc; charset=utf-8")
                 .header("Authorization", "Bearer #{jwtToken}")
                 .header("X-GWT-Module-Base", moduleBase)
-                .header("X-GWT-Permutation", "#{servletPolicy}")
+                .header("X-GWT-Permutation", "#{permStrongName}")
+                // field #2 = business service's own RPC policy strong name (servletRpcPolicy)
                 // ALL 10 strings go in the table first — GWT reads param values by index.
-                // 1=moduleBase 2=strongName 3=xsrfType 4=xsrfToken 5=svcClass 6=method
+                // 1=moduleBase 2=policy 3=xsrfType 4=xsrfToken 5=svcClass 6=method
                 // 7=StringType 8=StringType 9=name 10=email
                 // Data: 1|2|3|4 (xsrf) | 5|6 (service/method) | 2 (param count) | 7|8 (types) | 9|10 (values)
                 .body(StringBody(session ->
                     "7|2|10|" + moduleBase + "|" +
-                    session.getString("servletPolicy") + "|" +
+                    servletRpcPolicy + "|" +
                     xsrfType + "|" +
                     session.getString("xsrfToken") + "|" +
                     svcClass + "|submit|" +
